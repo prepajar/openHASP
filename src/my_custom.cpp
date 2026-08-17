@@ -141,6 +141,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 
 void custom_setup() {
     modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
+    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO2=TX, GPIO1=RX, 9600 8N1)"));
 }
 
 void custom_loop() {
@@ -156,9 +157,18 @@ void custom_every_5seconds() {
     int16_t raw_t1, raw_t2, raw_sp;
     bool ok = true;
 
-    ok &= modbus_read_register(DAIKIN_ADDR, 0, raw_t1);   // T1 - température ambiante
-    ok &= modbus_read_register(DAIKIN_ADDR, 1, raw_t2);   // T2 - température eau
-    ok &= modbus_read_register(DAIKIN_ADDR, 8, raw_sp);   // SP - consigne active
+    Serial.println(F("[DAIKIN] Tentative de lecture Modbus..."));
+
+    bool ok_t1 = modbus_read_register(DAIKIN_ADDR, 0, raw_t1);   // T1 - température ambiante
+    bool ok_t2 = modbus_read_register(DAIKIN_ADDR, 1, raw_t2);   // T2 - température eau
+    bool ok_sp = modbus_read_register(DAIKIN_ADDR, 8, raw_sp);   // SP - consigne active
+    ok = ok_t1 && ok_t2 && ok_sp;
+
+    // Logs de debug directement dans la console série - visibles même sans
+    // MQTT/Home Assistant configuré, pour vérifier que le Modbus fonctionne.
+    Serial.printf("[DAIKIN] T1 (ambiante) : %s (brut=%d)\n", ok_t1 ? "OK" : "ECHEC", ok_t1 ? raw_t1 : 0);
+    Serial.printf("[DAIKIN] T2 (eau)      : %s (brut=%d)\n", ok_t2 ? "OK" : "ECHEC", ok_t2 ? raw_t2 : 0);
+    Serial.printf("[DAIKIN] SP (consigne) : %s (brut=%d)\n", ok_sp ? "OK" : "ECHEC", ok_sp ? raw_sp : 0);
 
     g_modbus_ok = ok;
     if(ok) {
@@ -166,7 +176,11 @@ void custom_every_5seconds() {
         g_temp_eau      = raw_t2 / 10.0f;
         g_consigne      = raw_sp / 10.0f;
 
-        // Publie l'état vers MQTT : hasp/<plate>/state/daikin_temp etc.
+        Serial.printf("[DAIKIN] => Ambiante=%.1f°C  Eau=%.1f°C  Consigne=%.1f°C\n",
+                      g_temp_ambiante, g_temp_eau, g_consigne);
+
+        // Publie l'état vers MQTT si configuré : hasp/<plate>/state/daikin_temp etc.
+        // (si MQTT n'est pas configuré, ces appels ne font simplement rien)
         char buf[16];
         snprintf(buf, sizeof(buf), "%.1f", g_temp_ambiante);
         dispatch_state_subtopic("daikin_temp", buf);
@@ -177,6 +191,7 @@ void custom_every_5seconds() {
         snprintf(buf, sizeof(buf), "%.1f", g_consigne);
         dispatch_state_subtopic("daikin_consigne", buf);
     } else {
+        Serial.println(F("[DAIKIN] => ECHEC : aucune réponse valide de la carte (vérifier câblage A/B, alimentation, adresse Modbus)"));
         dispatch_state_subtopic("daikin_status", "erreur_modbus");
     }
 }
