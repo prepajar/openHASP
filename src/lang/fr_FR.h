@@ -153,8 +153,7 @@
 #define D_HTTP_MAIN_MENU "Menu principal"
 #define D_HTTP_REBOOT "Redémarrer"
 #define D_HTTP_CONFIGURATION "Configuration"
-#define D_HTTP_CONFIG_CHANGED                                                                                            \
-    "La configuration a changé, cliquez sur <a href='/reboot'>Redémarrer</a> pour enregistrer les modifications dans " 
+#define D_HTTP_CONFIG_CHANGED "La configuration a changé, cliquez sur <a href='/reboot'>Redémarrer</a> pour enregistrer les modifications dans " 
 #define D_HTTP_SENDING_PAGE "La page %S envoyée à %s"
 #define D_HTTP_FOOTER "par Francis Van Roie"
 
