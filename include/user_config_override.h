@@ -14,7 +14,6 @@
 // Active le mécanisme de code personnalisé d'openHASP
 #define HASP_USE_CUSTOM 1
 
-#endif // USER_CONFIG_OVERRIDE_H
 
 #define SERIAL_SPEED 115200
 
