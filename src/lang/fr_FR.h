@@ -203,7 +203,7 @@
 #define D_INFO_GATEWAY "Passerelle"
 #define D_INFO_DNS_SERVER "Serveur DNS"
 #define D_INFO_ENDPOINT_IP "Adresse IP du point final"
-#define D_INFO_ENDPOINT_IP "Port du point final"
+#define D_INFO_ENDPOINT_PORT "Port du point final"
 
 #define D_OOBE_MSG "Touchez l'écran pour configurer le WiFi ou branchez ce point d'accès:"
 #define D_OOBE_SCAN_TO_CONNECT "Scanner pour se connecter"
