@@ -4,8 +4,9 @@
 // de code personnalisé (HASP_USE_CUSTOM).
 //
 // Câblage : RS485 sur GPIO2 (TXD_EXT) / GPIO1 (RXD_EXT), 9600 bauds 8N1,
-// via la puce SP3485 déjà présente sur la carte du panneau -> bornier
-// A/B de la carte Daikin.
+// via la puce RS485 déjà présente sur la carte du panneau (transceiver à
+// direction automatique, confirmé par la datasheet WT32S3-86S - pas de
+// DE/RE à piloter en logiciel) -> bornier A/B de la carte Daikin.
 //
 // Registres Daikin utilisés (confirmés par le manuel officiel
 // EKWHCTRL1/EKRTCTRL1 Modbus RTU) :
@@ -14,11 +15,13 @@
 //   008 (SP)   lecture  - consigne active, x0.1
 //   231 (SP)   écriture - nouvelle consigne (5-40°C), x0.1
 //
-// NOTE HONNÊTE : ce fichier n'a jamais été compilé ni testé sur du vrai
-// matériel - c'est un point de départ solide (registres et câblage
-// confirmés par la doc officielle qu'on a utilisée tout au long du
-// projet), mais à valider/déboguer à la compilation et au premier test,
-// comme tout le reste de ce projet jusqu'ici.
+// NOTE : l'adresse Modbus réelle de la carte Daikin n'étant pas confirmée
+// avec certitude (dip-switches non documentés dans le manuel d'installation
+// général), ce fichier scanne automatiquement une plage d'adresses
+// candidates (1-16) jusqu'à obtenir une réponse valide, plutôt que de
+// supposer une adresse fixe. Un dump hexadécimal de chaque trame envoyée
+// et reçue (même partielle/invalide) est loggué pour faciliter le
+// diagnostic bas niveau (protocole ASCII vs RTU, câblage, etc.).
 // =====================================================================
 
 #include "my_custom.h"
@@ -27,18 +30,25 @@
 // --- Configuration ---
 static const int MODBUS_TX_PIN     = 2;   // TXD_EXT
 static const int MODBUS_RX_PIN     = 1;   // RXD_EXT
-static const uint8_t DAIKIN_ADDR   = 1;   // adresse Modbus de la carte Daikin
-                                            // (réglée sur la carte elle-même,
-                                            // registre 200 / dip-switches)
 static const uint32_t MODBUS_BAUD  = 9600;
+
+// Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
+// été trouvée. Plage large (couvre la plupart des configs dip-switch
+// typiques) - à étendre si rien ne répond dans cette plage.
+static const uint8_t ADDR_CANDIDATES[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+static const uint8_t NB_CANDIDATES = sizeof(ADDR_CANDIDATES) / sizeof(ADDR_CANDIDATES[0]);
 
 static HardwareSerial modbusSerial(1); // UART1 du ESP32-S3
 
 // --- État courant (mis à jour périodiquement) ---
-static float g_temp_ambiante = NAN;
-static float g_temp_eau      = NAN;
-static float g_consigne      = NAN;
-static bool  g_modbus_ok     = false;
+static float   g_temp_ambiante = NAN;
+static float   g_temp_eau      = NAN;
+static float   g_consigne      = NAN;
+static bool    g_modbus_ok     = false;
+
+static uint8_t g_scan_index    = 0;
+static uint8_t g_daikin_addr   = 0;      // 0 = pas encore trouvée
+static bool    g_addr_found    = false;
 
 // =====================================================================
 // Modbus RTU minimal "fait main" (fonctions 03 lecture / 06 écriture)
@@ -66,6 +76,14 @@ static void modbus_flush_input() {
     while(modbusSerial.available()) modbusSerial.read();
 }
 
+static void modbus_dump(const char* label, const uint8_t* data, uint8_t len) {
+    Serial.printf("[DAIKIN][%s] %d octet(s) : ", label, len);
+    for(uint8_t i = 0; i < len; i++) {
+        Serial.printf("%02X ", data[i]);
+    }
+    Serial.println();
+}
+
 // Lit UN registre "holding" (fonction 03). Retourne true si succès.
 static bool modbus_read_register(uint8_t slave_addr, uint16_t reg, int16_t& out_value) {
     uint8_t frame[8];
@@ -82,6 +100,7 @@ static bool modbus_read_register(uint8_t slave_addr, uint16_t reg, int16_t& out_
     modbus_flush_input();
     modbusSerial.write(frame, 8);
     modbusSerial.flush();
+    modbus_dump("TX", frame, 8);
 
     // Attente de la réponse : adresse(1) + fonction(1) + nb octets(1) +
     // données(2) + CRC(2) = 7 octets pour une lecture d'1 registre.
@@ -93,7 +112,9 @@ static bool modbus_read_register(uint8_t slave_addr, uint16_t reg, int16_t& out_
             resp[received++] = modbusSerial.read();
         }
     }
-    if(received < 7) return false; // timeout - pas de réponse
+    modbus_dump("RX", resp, received);
+
+    if(received < 7) return false; // timeout - pas de réponse (partielle ou nulle)
 
     if(resp[0] != slave_addr || resp[1] != 0x03 || resp[2] != 2) return false;
 
@@ -121,6 +142,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
     modbus_flush_input();
     modbusSerial.write(frame, 8);
     modbusSerial.flush();
+    modbus_dump("TX", frame, 8);
 
     // Un write réussi renvoie un echo de la trame envoyée (8 octets).
     uint32_t start = millis();
@@ -131,6 +153,8 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
             resp[received++] = modbusSerial.read();
         }
     }
+    modbus_dump("RX", resp, received);
+
     return received == 8;
 }
 
@@ -141,6 +165,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 void custom_setup() {
     modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
     Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO2=TX, GPIO1=RX, 9600 8N1)"));
+    Serial.println(F("[DAIKIN] Démarrage du scan d'adresses Modbus (1-16)..."));
 }
 
 void custom_loop() {
@@ -154,17 +179,32 @@ void custom_every_second() {
 
 void custom_every_5seconds() {
     int16_t raw_t1, raw_t2, raw_sp;
-    bool ok = true;
 
+    if (!g_addr_found) {
+        // --- Mode scan : on teste une adresse candidate par cycle ---
+        uint8_t candidate = ADDR_CANDIDATES[g_scan_index];
+        Serial.printf("[DAIKIN] Scan adresse Modbus : test @%d...\n", candidate);
+
+        bool ok = modbus_read_register(candidate, 0, raw_t1); // T1 comme sonde de test
+        if (ok) {
+            g_daikin_addr = candidate;
+            g_addr_found  = true;
+            Serial.printf("[DAIKIN] *** ADRESSE TROUVEE : %d (T1 brut=%d) ***\n", candidate, raw_t1);
+        } else {
+            Serial.printf("[DAIKIN] Adresse %d : pas de réponse valide\n", candidate);
+            g_scan_index = (g_scan_index + 1) % NB_CANDIDATES;
+        }
+        return; // on ne fait rien d'autre tant que l'adresse n'est pas confirmée
+    }
+
+    // --- Mode normal : adresse connue, lecture des 3 registres ---
     Serial.println(F("[DAIKIN] Tentative de lecture Modbus..."));
 
-    bool ok_t1 = modbus_read_register(DAIKIN_ADDR, 0, raw_t1);   // T1 - température ambiante
-    bool ok_t2 = modbus_read_register(DAIKIN_ADDR, 1, raw_t2);   // T2 - température eau
-    bool ok_sp = modbus_read_register(DAIKIN_ADDR, 8, raw_sp);   // SP - consigne active
-    ok = ok_t1 && ok_t2 && ok_sp;
+    bool ok_t1 = modbus_read_register(g_daikin_addr, 0, raw_t1);   // T1 - température ambiante
+    bool ok_t2 = modbus_read_register(g_daikin_addr, 1, raw_t2);   // T2 - température eau
+    bool ok_sp = modbus_read_register(g_daikin_addr, 8, raw_sp);   // SP - consigne active
+    bool ok = ok_t1 && ok_t2 && ok_sp;
 
-    // Logs de debug directement dans la console série - visibles même sans
-    // MQTT/Home Assistant configuré, pour vérifier que le Modbus fonctionne.
     Serial.printf("[DAIKIN] T1 (ambiante) : %s (brut=%d)\n", ok_t1 ? "OK" : "ECHEC", ok_t1 ? raw_t1 : 0);
     Serial.printf("[DAIKIN] T2 (eau)      : %s (brut=%d)\n", ok_t2 ? "OK" : "ECHEC", ok_t2 ? raw_t2 : 0);
     Serial.printf("[DAIKIN] SP (consigne) : %s (brut=%d)\n", ok_sp ? "OK" : "ECHEC", ok_sp ? raw_sp : 0);
@@ -190,7 +230,10 @@ void custom_every_5seconds() {
         snprintf(buf, sizeof(buf), "%.1f", g_consigne);
         dispatch_state_subtopic("daikin_consigne", buf);
     } else {
-        Serial.println(F("[DAIKIN] => ECHEC : aucune réponse valide de la carte (vérifier câblage A/B, alimentation, adresse Modbus)"));
+        // Perte de communication après avoir eu l'adresse - on relance le scan
+        Serial.println(F("[DAIKIN] => ECHEC : perte de communication - retour en mode scan"));
+        g_addr_found = false;
+        g_scan_index = 0;
         dispatch_state_subtopic("daikin_status", "erreur_modbus");
     }
 }
@@ -215,16 +258,21 @@ void custom_get_sensors(JsonDocument& doc) {
     sensor[F("temp_eau")]      = g_temp_eau;
     sensor[F("consigne")]      = g_consigne;
     sensor[F("modbus_ok")]     = g_modbus_ok;
+    sensor[F("adresse")]       = g_daikin_addr;
 }
 
 // Reçoit les commandes MQTT entrantes, ex :
 //   hasp/plate/command/daikin_setpoint   payload "21.5"
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
     if(strcmp(topic, "daikin_setpoint") == 0) {
+        if (!g_addr_found) {
+            dispatch_state_subtopic("daikin_setpoint_ack", "erreur_adresse_inconnue");
+            return;
+        }
         float nouvelle_consigne = atof(payload);
         if(nouvelle_consigne >= 5.0f && nouvelle_consigne <= 40.0f) {
             int16_t raw = (int16_t)(nouvelle_consigne * 10);
-            bool ok = modbus_write_register(DAIKIN_ADDR, 231, raw);
+            bool ok = modbus_write_register(g_daikin_addr, 231, raw);
             dispatch_state_subtopic("daikin_setpoint_ack", ok ? "ok" : "erreur");
         }
     }
