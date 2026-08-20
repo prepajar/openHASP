@@ -51,8 +51,8 @@
 #include <HardwareSerial.h>
 
 // --- Configuration ---
-static const int MODBUS_TX_PIN     = 43;  // "TXD" natif du module (pin 34) - test en cours
-static const int MODBUS_RX_PIN     = 44;  // "RXD" natif du module (pin 33) - test en cours
+static const int MODBUS_TX_PIN     = 39;  // "TXD" natif du module (pin 34) - test en cours
+static const int MODBUS_RX_PIN     = 40;  // "RXD" natif du module (pin 33) - test en cours
 static const uint32_t MODBUS_BAUD  = 9600;
 
 // Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
