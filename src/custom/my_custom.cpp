@@ -38,8 +38,8 @@
 #include <HardwareSerial.h>
 
 // --- Configuration ---
-static const int MODBUS_TX_PIN     = 4;   // TXD_IO (confirmé par le schéma officiel, IO MAP)
-static const int MODBUS_RX_PIN     = 5;   // RXD_IO (confirmé par le schéma officiel, IO MAP)
+static const int MODBUS_TX_PIN     = 34;   // TXD_IO (confirmé par le schéma officiel, IO MAP)
+static const int MODBUS_RX_PIN     = 33;   // RXD_IO (confirmé par le schéma officiel, IO MAP)
 static const uint32_t MODBUS_BAUD  = 9600;
 
 // Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
