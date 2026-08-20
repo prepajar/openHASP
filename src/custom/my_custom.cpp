@@ -3,20 +3,33 @@
 // EKRTCTRL), intégré directement dans openHASP via son mécanisme officiel
 // de code personnalisé (HASP_USE_CUSTOM).
 //
-// Câblage : RS485 sur GPIO4 (TXD_IO) / GPIO5 (RXD_IO), 9600 bauds 8N1,
-// via la puce SP3485 déjà présente sur la carte du panneau (transceiver à
-// direction automatique piloté par transistor Q3, confirmé par le schéma
-// électronique officiel du fabricant - pas de DE/RE à piloter en logiciel)
-// -> bornier A/B de la carte Daikin.
+// Câblage : RS485 sur GPIO43 (TXD, pin module 34) / GPIO44 (RXD, pin module
+// 33), 9600 bauds 8N1, via la puce SP3485 déjà présente sur la carte du
+// panneau (transceiver à direction automatique piloté par transistor Q3,
+// pas de DE/RE à piloter en logiciel) -> bornier A/B de la carte Daikin.
 //
-// CORRECTIF IMPORTANT : ce fichier utilisait auparavant GPIO2/GPIO1 (valeurs
-// tirées du board.h d'openHASP pour ce modèle de panneau), mais le schéma
-// électronique officiel du fabricant (bloc "UART TO RS485" + encadré
-// "IO MAP") montre clairement que les nœuds TXD_IO/RXD_IO qui pilotent le
-// SP3485 sont en réalité câblés sur GPIO4 et GPIO5. GPIO2/GPIO1 ne semblent
-// PAS reliées à la puce RS485 sur ce PCB - ce qui expliquerait un silence
-// total sur le bus, indépendamment de tout ce qui a été testé côté carte
-// Daikin (adresse, protocole, câblage, masse...).
+// HISTORIQUE DES CORRECTIFS DE PINS (à ne pas refaire une 3e fois sans
+// preuve à l'oscillo) :
+//   1) GPIO2/GPIO1 (valeurs tirées du board.h d'openHASP) : silence total,
+//      jamais confirmé comme correct.
+//   2) GPIO4/GPIO5 (lecture de l'encadré "IO MAP" du schéma officiel,
+//      net-labels TXD_IO/RXD_IO) : reflashé et testé, TOUJOURS silence
+//      total. Vérification à l'oscilloscope directement sur la sortie
+//      RS485 du panneau (bornes A/B) pendant l'émission : AUCUN signal
+//      électrique du tout, alors que le firmware logge bien un TX toutes
+//      les 5s. Donc GPIO4/GPIO5 ne sont PAS reliées à la puce SP3485 sur
+//      ce PCB (ou en tout cas rien n'en sort côté A/B) - piste écartée.
+//   3) GPIO43/GPIO44 (pins natives "TXD"/"RXD" du module, position 33/34) :
+//      hypothèse de l'utilisateur après relecture du schéma - EN COURS DE
+//      TEST. ATTENTION : ce sont aussi les pins historiquement utilisées
+//      par le port debug (connecteur J6, "TX0"/"RX0") relié à l'adaptateur
+//      CH340 pour les logs série - si c'est bien le cas, activer l'UART1
+//      Modbus sur ces mêmes pins va probablement perturber/casser la
+//      console de logs (conflit de périphérique UART sur les mêmes GPIO).
+//      À surveiller pendant le test : si la console se corrompt/s'arrête
+//      dès custom_setup(), c'est cohérent avec un conflit de pins - dans ce
+//      cas, vérifier à l'oscilloscope directement sur A/B (pas besoin des
+//      logs) si un signal apparaît enfin toutes les 5s.
 //
 // Registres Daikin utilisés (confirmés par le manuel officiel
 // EKWHCTRL1/EKRTCTRL1 Modbus RTU) :
@@ -38,8 +51,8 @@
 #include <HardwareSerial.h>
 
 // --- Configuration ---
-static const int MODBUS_TX_PIN     = 4;   // TXD_IO (confirmé par le schéma officiel, IO MAP)
-static const int MODBUS_RX_PIN     = 5;   // RXD_IO (confirmé par le schéma officiel, IO MAP)
+static const int MODBUS_TX_PIN     = 43;  // "TXD" natif du module (pin 34) - test en cours
+static const int MODBUS_RX_PIN     = 44;  // "RXD" natif du module (pin 33) - test en cours
 static const uint32_t MODBUS_BAUD  = 9600;
 
 // Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
@@ -174,7 +187,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 
 void custom_setup() {
     modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
-    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO4=TX, GPIO5=RX, 9600 8N1)"));
+    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO43=TX, GPIO44=RX, 9600 8N1)"));
     Serial.println(F("[DAIKIN] Démarrage du scan d'adresses Modbus (1-16)..."));
 }
 
