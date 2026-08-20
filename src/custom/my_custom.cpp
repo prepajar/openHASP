@@ -3,10 +3,20 @@
 // EKRTCTRL), intégré directement dans openHASP via son mécanisme officiel
 // de code personnalisé (HASP_USE_CUSTOM).
 //
-// Câblage : RS485 sur GPIO2 (TXD_EXT) / GPIO1 (RXD_EXT), 9600 bauds 8N1,
-// via la puce RS485 déjà présente sur la carte du panneau (transceiver à
-// direction automatique, confirmé par la datasheet WT32S3-86S - pas de
-// DE/RE à piloter en logiciel) -> bornier A/B de la carte Daikin.
+// Câblage : RS485 sur GPIO4 (TXD_IO) / GPIO5 (RXD_IO), 9600 bauds 8N1,
+// via la puce SP3485 déjà présente sur la carte du panneau (transceiver à
+// direction automatique piloté par transistor Q3, confirmé par le schéma
+// électronique officiel du fabricant - pas de DE/RE à piloter en logiciel)
+// -> bornier A/B de la carte Daikin.
+//
+// CORRECTIF IMPORTANT : ce fichier utilisait auparavant GPIO2/GPIO1 (valeurs
+// tirées du board.h d'openHASP pour ce modèle de panneau), mais le schéma
+// électronique officiel du fabricant (bloc "UART TO RS485" + encadré
+// "IO MAP") montre clairement que les nœuds TXD_IO/RXD_IO qui pilotent le
+// SP3485 sont en réalité câblés sur GPIO4 et GPIO5. GPIO2/GPIO1 ne semblent
+// PAS reliées à la puce RS485 sur ce PCB - ce qui expliquerait un silence
+// total sur le bus, indépendamment de tout ce qui a été testé côté carte
+// Daikin (adresse, protocole, câblage, masse...).
 //
 // Registres Daikin utilisés (confirmés par le manuel officiel
 // EKWHCTRL1/EKRTCTRL1 Modbus RTU) :
@@ -28,8 +38,8 @@
 #include <HardwareSerial.h>
 
 // --- Configuration ---
-static const int MODBUS_TX_PIN     = 2;   // TXD_EXT
-static const int MODBUS_RX_PIN     = 1;   // RXD_EXT
+static const int MODBUS_TX_PIN     = 4;   // TXD_IO (confirmé par le schéma officiel, IO MAP)
+static const int MODBUS_RX_PIN     = 5;   // RXD_IO (confirmé par le schéma officiel, IO MAP)
 static const uint32_t MODBUS_BAUD  = 9600;
 
 // Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
@@ -164,7 +174,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 
 void custom_setup() {
     modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
-    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO2=TX, GPIO1=RX, 9600 8N1)"));
+    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO4=TX, GPIO5=RX, 9600 8N1)"));
     Serial.println(F("[DAIKIN] Démarrage du scan d'adresses Modbus (1-16)..."));
 }
 
