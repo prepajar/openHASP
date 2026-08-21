@@ -1,181 +1,116 @@
 // =====================================================================
-// my_custom.cpp - Pont Modbus RTU vers la carte Daikin FWXT (EKWHCTRL/
-// EKRTCTRL), intégré directement dans openHASP via son mécanisme officiel
-// de code personnalisé (HASP_USE_CUSTOM).
+// my_custom.cpp - Lecture du capteur température/humidité SHT20 embarqué
+// sur le panneau ZX3D95CE01S-TR-4848 (Panlee), intégrée dans openHASP via
+// son mécanisme officiel de code personnalisé (HASP_USE_CUSTOM).
 //
-// Câblage : RS485 sur GPIO4 (TX) / GPIO5 (RX), 9600 bauds 8N1, via la puce
-// SP3485 déjà présente sur la carte du panneau (transceiver à direction
-// automatique piloté par transistor Q3, pas de DE/RE à piloter en
-// logiciel) -> bornier A/B de la carte Daikin.
+// HISTORIQUE DU PROJET (pour mémoire) :
+// Ce fichier contenait auparavant un pont Modbus RTU vers la carte de
+// contrôle Daikin EKRTCTRL2 (bornier "+A B-", GPIO4/GPIO5 via la puce
+// RS485 SP3485). Après un long diagnostic (voir historique Git de ce
+// fichier), la comm avec cette carte a été abandonnée : le bus "-AB+" est
+// un protocole propriétaire Daikin non documenté (confirmé par le manuel
+// officiel), et même une fois cette conclusion posée, aucun signal
+// électrique n'a jamais pu être confirmé en sortie du panneau malgré
+// plusieurs hypothèses de GPIO testées. Le projet est passé à un pilotage
+// DIY des actionneurs (moteur ventilateur + moteur pas à pas) par un ESP
+// secondaire, indépendant du panneau. Tout le code Modbus a été retiré
+// d'ici - ce fichier ne gère plus que l'affichage local temp/humidité.
 //
-// HISTORIQUE DES CORRECTIFS DE PINS (ne pas repartir dans une nouvelle
-// hypothèse de GPIO sans raison nouvelle - voir plus bas) :
-//   1) GPIO2/GPIO1 (board.h openHASP, positions module 39/40 selon la page
-//      vendeur) : config d'origine, jamais testée précisément à l'oscillo
-//      pour la présence d'un signal TX à l'époque.
-//   2) GPIO4/GPIO5 (lecture de l'encadré "IO MAP" du schéma officiel
-//      fabricant, net-labels TXD_IO/RXD_IO) : testée, AUCUN signal à
-//      l'oscillo sur A/B pendant l'émission.
-//   3) GPIO43/GPIO44 (pins natives "TXD"/"RXD" du module, position 33/34) :
-//      testée, AUCUN signal à l'oscillo sur A/B non plus.
-//   RETOUR À GPIO4/GPIO5, confirmé cette fois par INSPECTION PHYSIQUE
-//   DIRECTE du circuit imprimé par l'utilisateur (traçage des pistes au
-//   plus près de la puce SP3485, pas juste une lecture de schéma) - preuve
-//   la plus fiable obtenue jusqu'ici. Étant donné que GPIO4/GPIO5 avait
-//   déjà été testé électriquement à vide, le problème n'est donc
-//   probablement PAS le choix du GPIO mais un souci en aval, au niveau de
-//   la puce SP3485 elle-même ou du contrôle de direction DE/RE - à sonder
-//   directement sur les pattes du composant (VCC/GND, nœud DE/RE, DI)
-//   plutôt que de continuer à changer de pins ESP32.
+// SOURCE DE CETTE IMPLÉMENTATION :
+// Le fabricant du panneau fournit un firmware de démo distinct (ESP-IDF +
+// QMSD UI, PAS openHASP) qui lit un capteur SHT20 (I2C, adresse 0x40) sur
+// le MÊME bus I2C que le contrôleur tactile FT6336U déjà utilisé par
+// openHASP (SDA=GPIO15, SCL=GPIO6 - cf board.h officiel). Cette
+// implémentation reprend exactement ce câblage/protocole (voir
+// TR/main/sht20_bee.c du firmware de démo fabricant), portée sur la
+// librairie Arduino Wire pour s'intégrer à openHASP.
 //
-// Registres Daikin utilisés (confirmés par le manuel officiel
-// EKWHCTRL1/EKRTCTRL1 Modbus RTU) :
-//   000 (T1)   lecture  - température ambiante, x0.1
-//   001 (T2)   lecture  - température eau, x0.1
-//   008 (SP)   lecture  - consigne active, x0.1
-//   231 (SP)   écriture - nouvelle consigne (5-40°C), x0.1
+// IMPORTANT - à vérifier par l'utilisateur :
+// Le firmware de démo du fabricant fait lui-même un scan I2C au boot et
+// n'active la lecture SHT20 que si l'adresse 0x40 répond ("设备存在" /
+// "device present" dans leurs logs) - sous-entendu : la puce SHT20 n'est
+// peut-être pas montée sur toutes les variantes de ce panneau (le zip
+// fabricant s'appelle explicitement "...带温湿度源码" = "...AVEC capteur
+// temp/humidité", ce qui suggère une variante spécifique). Ce fichier fait
+// la même vérification au démarrage (custom_setup()) et se met en état
+// "capteur absent" proprement si l'adresse 0x40 ne répond pas, plutôt que
+// de bloquer. Si "SHT20 non détecté" apparaît dans les logs, vérifier
+// physiquement la présence d'un petit composant (SOIC/DFN) à proximité du
+// connecteur tactile, ou confirmer via un scan I2C manuel.
 //
-// NOTE : l'adresse Modbus réelle de la carte Daikin n'étant pas confirmée
-// avec certitude (dip-switches non documentés dans le manuel d'installation
-// général), ce fichier scanne automatiquement une plage d'adresses
-// candidates (1-16) jusqu'à obtenir une réponse valide, plutôt que de
-// supposer une adresse fixe. Un dump hexadécimal de chaque trame envoyée
-// et reçue (même partielle/invalide) est loggué pour faciliter le
-// diagnostic bas niveau (protocole ASCII vs RTU, câblage, etc.).
+// PROTOCOLE SHT20 (repris du firmware fabricant, cf sht20_bee.c) :
+//   Écrire 0xF3 (mesure T, mode "no hold") puis attendre ~85ms puis lire
+//   3 octets (MSB, LSB, CRC - CRC non vérifié ici, comme dans le code
+//   fabricant d'origine).
+//   Écrire 0xF5 (mesure RH, mode "no hold") puis attendre ~29ms puis lire
+//   3 octets de la même façon.
+//   T(°C)  = 175.72 * raw16/65536 - 46.85   (raw16 = MSB<<8 | (LSB & 0xFC))
+//   RH(%)  = 125.0  * raw16/65536 - 6.0
 // =====================================================================
 
 #include "my_custom.h"
-#include <HardwareSerial.h>
+#include <Wire.h>
 
-// --- Configuration ---
-static const int MODBUS_TX_PIN     = 4;   // confirmé par inspection physique du PCB
-static const int MODBUS_RX_PIN     = 5;   // confirmé par inspection physique du PCB
-static const uint32_t MODBUS_BAUD  = 9600;
+// --- Configuration I2C (identique au bus tactile FT6336U déjà initialisé
+// par le driver tactile officiel d'openHASP - on réutilise le même bus,
+// pas de nouveau câblage nécessaire) ---
+static const int SHT20_SDA_PIN   = 15;
+static const int SHT20_SCL_PIN   = 6;
+static const uint32_t I2C_FREQ   = 400000;
+static const uint8_t  SHT20_ADDR = 0x40;
 
-// Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
-// été trouvée. Plage large (couvre la plupart des configs dip-switch
-// typiques) - à étendre si rien ne répond dans cette plage.
-static const uint8_t ADDR_CANDIDATES[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
-static const uint8_t NB_CANDIDATES = sizeof(ADDR_CANDIDATES) / sizeof(ADDR_CANDIDATES[0]);
-
-static HardwareSerial modbusSerial(1); // UART1 du ESP32-S3
+static const uint8_t SHT20_CMD_TEMP_NOHOLD = 0xF3;
+static const uint8_t SHT20_CMD_HUM_NOHOLD  = 0xF5;
 
 // --- État courant (mis à jour périodiquement) ---
-static float   g_temp_ambiante = NAN;
-static float   g_temp_eau      = NAN;
-static float   g_consigne      = NAN;
-static bool    g_modbus_ok     = false;
-
-static uint8_t g_scan_index    = 0;
-static uint8_t g_daikin_addr   = 0;      // 0 = pas encore trouvée
-static bool    g_addr_found    = false;
+static float g_temperature   = NAN;
+static float g_humidite      = NAN;
+static bool  g_sht20_present = false;
 
 // =====================================================================
-// Modbus RTU minimal "fait main" (fonctions 03 lecture / 06 écriture)
-// Pas de dépendance à une librairie externe - évite d'avoir à modifier
-// platformio.ini pour ajouter une lib tierce.
+// Driver SHT20 minimal (I2C via Wire, mode "no hold" avec délai fixe -
+// évite de dépendre du clock-stretching matériel pour le mode "hold")
 // =====================================================================
 
-static uint16_t modbus_crc16(const uint8_t* data, uint8_t len) {
-    uint16_t crc = 0xFFFF;
-    for(uint8_t pos = 0; pos < len; pos++) {
-        crc ^= (uint16_t)data[pos];
-        for(uint8_t i = 0; i < 8; i++) {
-            if(crc & 0x0001) {
-                crc >>= 1;
-                crc ^= 0xA001;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return crc;
+// Vérifie la présence du capteur à l'adresse 0x40 (simple ACK I2C).
+static bool sht20_probe() {
+    Wire.beginTransmission(SHT20_ADDR);
+    return (Wire.endTransmission() == 0);
 }
 
-static void modbus_flush_input() {
-    while(modbusSerial.available()) modbusSerial.read();
-}
+// Lance une mesure (commande "no hold") et lit le résultat brut 16 bits
+// après le délai de conversion requis. Retourne true si succès (ACK reçu
+// à l'écriture ET aux 2 octets de données lus).
+static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
+    Wire.beginTransmission(SHT20_ADDR);
+    Wire.write(cmd);
+    if (Wire.endTransmission() != 0) return false;
 
-static void modbus_dump(const char* label, const uint8_t* data, uint8_t len) {
-    Serial.printf("[DAIKIN][%s] %d octet(s) : ", label, len);
-    for(uint8_t i = 0; i < len; i++) {
-        Serial.printf("%02X ", data[i]);
-    }
-    Serial.println();
-}
+    delay(delay_ms);
 
-// Lit UN registre "holding" (fonction 03). Retourne true si succès.
-static bool modbus_read_register(uint8_t slave_addr, uint16_t reg, int16_t& out_value) {
-    uint8_t frame[8];
-    frame[0] = slave_addr;
-    frame[1] = 0x03;                    // Read Holding Registers
-    frame[2] = (reg >> 8) & 0xFF;
-    frame[3] = reg & 0xFF;
-    frame[4] = 0x00;
-    frame[5] = 0x01;                    // 1 seul registre
-    uint16_t crc = modbus_crc16(frame, 6);
-    frame[6] = crc & 0xFF;
-    frame[7] = (crc >> 8) & 0xFF;
+    uint8_t received = Wire.requestFrom((int)SHT20_ADDR, 3);
+    if (received < 2) return false; // pas assez d'octets reçus
 
-    modbus_flush_input();
-    modbusSerial.write(frame, 8);
-    modbusSerial.flush();
-    modbus_dump("TX", frame, 8);
+    uint8_t msb = Wire.read();
+    uint8_t lsb = Wire.read();
+    if (received >= 3) Wire.read(); // octet CRC - lu mais non vérifié
 
-    // Attente de la réponse : adresse(1) + fonction(1) + nb octets(1) +
-    // données(2) + CRC(2) = 7 octets pour une lecture d'1 registre.
-    uint32_t start = millis();
-    uint8_t resp[7];
-    uint8_t received = 0;
-    while(millis() - start < 300 && received < 7) {
-        if(modbusSerial.available()) {
-            resp[received++] = modbusSerial.read();
-        }
-    }
-    modbus_dump("RX", resp, received);
-
-    if(received < 7) return false; // timeout - pas de réponse (partielle ou nulle)
-
-    if(resp[0] != slave_addr || resp[1] != 0x03 || resp[2] != 2) return false;
-
-    uint16_t resp_crc = modbus_crc16(resp, 5);
-    uint16_t recv_crc = resp[5] | (resp[6] << 8);
-    if(resp_crc != recv_crc) return false; // CRC invalide
-
-    out_value = (int16_t)((resp[3] << 8) | resp[4]);
+    raw_out = ((uint16_t)msb << 8) | (lsb & 0xFC); // 2 bits de statut à ignorer
     return true;
 }
 
-// Écrit UN registre "holding" (fonction 06). Retourne true si succès.
-static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t value) {
-    uint8_t frame[8];
-    frame[0] = slave_addr;
-    frame[1] = 0x06;                    // Write Single Register
-    frame[2] = (reg >> 8) & 0xFF;
-    frame[3] = reg & 0xFF;
-    frame[4] = (value >> 8) & 0xFF;
-    frame[5] = value & 0xFF;
-    uint16_t crc = modbus_crc16(frame, 6);
-    frame[6] = crc & 0xFF;
-    frame[7] = (crc >> 8) & 0xFF;
+static bool sht20_get_temperature(float& out_c) {
+    uint16_t raw;
+    if (!sht20_read_raw(SHT20_CMD_TEMP_NOHOLD, 85, raw)) return false;
+    out_c = 175.72f * ((float)raw / 65536.0f) - 46.85f;
+    return true;
+}
 
-    modbus_flush_input();
-    modbusSerial.write(frame, 8);
-    modbusSerial.flush();
-    modbus_dump("TX", frame, 8);
-
-    // Un write réussi renvoie un echo de la trame envoyée (8 octets).
-    uint32_t start = millis();
-    uint8_t resp[8];
-    uint8_t received = 0;
-    while(millis() - start < 300 && received < 8) {
-        if(modbusSerial.available()) {
-            resp[received++] = modbusSerial.read();
-        }
-    }
-    modbus_dump("RX", resp, received);
-
-    return received == 8;
+static bool sht20_get_humidity(float& out_rh) {
+    uint16_t raw;
+    if (!sht20_read_raw(SHT20_CMD_HUM_NOHOLD, 29, raw)) return false;
+    out_rh = 125.0f * ((float)raw / 65536.0f) - 6.0f;
+    return true;
 }
 
 // =====================================================================
@@ -183,14 +118,23 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 // =====================================================================
 
 void custom_setup() {
-    modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
-    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO4=TX, GPIO5=RX, 9600 8N1)"));
-    Serial.println(F("[DAIKIN] Démarrage du scan d'adresses Modbus (1-16)..."));
+    // Le bus I2C (SDA=15/SCL=6) est déjà initialisé par le driver tactile
+    // FT6336U d'openHASP avant l'appel à custom_setup(). On rappelle
+    // Wire.begin() avec les mêmes paramètres par sécurité/portabilité -
+    // sans effet de bord attendu puisque ce sont exactement les mêmes
+    // broches/fréquence que celles déjà utilisées pour le tactile.
+    Wire.begin(SHT20_SDA_PIN, SHT20_SCL_PIN, I2C_FREQ);
+
+    g_sht20_present = sht20_probe();
+    if (g_sht20_present) {
+        Serial.println(F("[SHT20] Capteur détecté à l'adresse 0x40 (bus I2C tactile partagé)"));
+    } else {
+        Serial.println(F("[SHT20] AUCUN capteur détecté à l'adresse 0x40 - vérifier que la puce est bien montée sur ce panneau"));
+    }
 }
 
 void custom_loop() {
-    // rien ici - tout se passe dans custom_every_5seconds(), pour ne pas
-    // bloquer la boucle principale (LVGL/tactile) avec les délais Modbus
+    // rien ici - la lecture se fait dans custom_every_5seconds()
 }
 
 void custom_every_second() {
@@ -198,102 +142,67 @@ void custom_every_second() {
 }
 
 void custom_every_5seconds() {
-    int16_t raw_t1, raw_t2, raw_sp;
-
-    if (!g_addr_found) {
-        // --- Mode scan : on teste une adresse candidate par cycle ---
-        uint8_t candidate = ADDR_CANDIDATES[g_scan_index];
-        Serial.printf("[DAIKIN] Scan adresse Modbus : test @%d...\n", candidate);
-
-        bool ok = modbus_read_register(candidate, 0, raw_t1); // T1 comme sonde de test
-        if (ok) {
-            g_daikin_addr = candidate;
-            g_addr_found  = true;
-            Serial.printf("[DAIKIN] *** ADRESSE TROUVEE : %d (T1 brut=%d) ***\n", candidate, raw_t1);
-        } else {
-            Serial.printf("[DAIKIN] Adresse %d : pas de réponse valide\n", candidate);
-            g_scan_index = (g_scan_index + 1) % NB_CANDIDATES;
+    if (!g_sht20_present) {
+        // Nouvelle tentative périodique, au cas où le capteur n'était pas
+        // encore prêt au boot (faux négatif) - sans bloquer le reste.
+        g_sht20_present = sht20_probe();
+        if (!g_sht20_present) {
+            g_temperature = NAN;
+            g_humidite    = NAN;
+            return;
         }
-        return; // on ne fait rien d'autre tant que l'adresse n'est pas confirmée
+        Serial.println(F("[SHT20] Capteur détecté (nouvelle tentative)"));
     }
 
-    // --- Mode normal : adresse connue, lecture des 3 registres ---
-    Serial.println(F("[DAIKIN] Tentative de lecture Modbus..."));
+    float t, h;
+    bool ok_t = sht20_get_temperature(t);
+    bool ok_h = sht20_get_humidity(h);
 
-    bool ok_t1 = modbus_read_register(g_daikin_addr, 0, raw_t1);   // T1 - température ambiante
-    bool ok_t2 = modbus_read_register(g_daikin_addr, 1, raw_t2);   // T2 - température eau
-    bool ok_sp = modbus_read_register(g_daikin_addr, 8, raw_sp);   // SP - consigne active
-    bool ok = ok_t1 && ok_t2 && ok_sp;
+    if (ok_t) g_temperature = t;
+    if (ok_h) g_humidite    = h;
 
-    Serial.printf("[DAIKIN] T1 (ambiante) : %s (brut=%d)\n", ok_t1 ? "OK" : "ECHEC", ok_t1 ? raw_t1 : 0);
-    Serial.printf("[DAIKIN] T2 (eau)      : %s (brut=%d)\n", ok_t2 ? "OK" : "ECHEC", ok_t2 ? raw_t2 : 0);
-    Serial.printf("[DAIKIN] SP (consigne) : %s (brut=%d)\n", ok_sp ? "OK" : "ECHEC", ok_sp ? raw_sp : 0);
+    if (ok_t && ok_h) {
+        Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", g_temperature, g_humidite);
 
-    g_modbus_ok = ok;
-    if(ok) {
-        g_temp_ambiante = raw_t1 / 10.0f;
-        g_temp_eau      = raw_t2 / 10.0f;
-        g_consigne      = raw_sp / 10.0f;
-
-        Serial.printf("[DAIKIN] => Ambiante=%.1f°C  Eau=%.1f°C  Consigne=%.1f°C\n",
-                      g_temp_ambiante, g_temp_eau, g_consigne);
-
-        // Publie l'état vers MQTT si configuré : hasp/<plate>/state/daikin_temp etc.
-        // (si MQTT n'est pas configuré, ces appels ne font simplement rien)
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", g_temp_ambiante);
-        dispatch_state_subtopic("daikin_temp", buf);
+        snprintf(buf, sizeof(buf), "%.1f", g_temperature);
+        dispatch_state_subtopic("temperature", buf);
 
-        snprintf(buf, sizeof(buf), "%.1f", g_temp_eau);
-        dispatch_state_subtopic("daikin_temp_eau", buf);
-
-        snprintf(buf, sizeof(buf), "%.1f", g_consigne);
-        dispatch_state_subtopic("daikin_consigne", buf);
+        snprintf(buf, sizeof(buf), "%.1f", g_humidite);
+        dispatch_state_subtopic("humidite", buf);
     } else {
-        // Perte de communication après avoir eu l'adresse - on relance le scan
-        Serial.println(F("[DAIKIN] => ECHEC : perte de communication - retour en mode scan"));
-        g_addr_found = false;
-        g_scan_index = 0;
-        dispatch_state_subtopic("daikin_status", "erreur_modbus");
+        Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
+                      ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
+        g_sht20_present = false; // on retentera un probe complet au prochain cycle
     }
 }
 
 bool custom_pin_in_use(uint8_t pin) {
-    return pin == MODBUS_TX_PIN || pin == MODBUS_RX_PIN;
+    // GPIO15/GPIO6 sont déjà déclarées utilisées par le driver tactile
+    // officiel d'openHASP (bus I2C partagé) - pas besoin de les
+    // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
+    return false;
 }
 
-// Point d'accroche appelé PAR le noyau openHASP (hasp_dispatch.cpp) lorsqu'un
-// état est publié en interne - on ne s'en sert pas nous-mêmes ici (on publie
-// nos propres données via dispatch_state_subtopic() dans l'autre sens),
-// mais openHASP exige que cette fonction existe quelque part dans le code
-// personnalisé, sinon l'assemblage final échoue.
+// Point d'accroche appelé PAR le noyau openHASP lorsqu'un état est publié
+// en interne - non utilisé ici (openHASP exige juste que la fonction
+// existe quelque part dans le code personnalisé).
 void custom_state_subtopic(const char* subtopic, const char* payload) {
     // rien à faire ici pour l'instant
 }
 
 // Ajoute nos valeurs au message de capteurs périodique d'openHASP
 void custom_get_sensors(JsonDocument& doc) {
-    JsonObject sensor = doc.createNestedObject(F("daikin"));
-    sensor[F("temp_ambiante")] = g_temp_ambiante;
-    sensor[F("temp_eau")]      = g_temp_eau;
-    sensor[F("consigne")]      = g_consigne;
-    sensor[F("modbus_ok")]     = g_modbus_ok;
-    sensor[F("adresse")]       = g_daikin_addr;
+    JsonObject sensor = doc.createNestedObject(F("sht20"));
+    sensor[F("temperature")] = g_temperature;
+    sensor[F("humidite")]    = g_humidite;
+    sensor[F("present")]     = g_sht20_present;
 }
 
-// Reçoit les commandes MQTT entrantes, ex :
-//   hasp/plate/command/daikin_setpoint   payload "21.5"
+// Réservé pour de futures commandes MQTT entrantes - rien pour l'instant
+// côté température/humidité (lecture seule), mais la fonction doit exister.
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
-    if(strcmp(topic, "daikin_setpoint") == 0) {
-        if (!g_addr_found) {
-            dispatch_state_subtopic("daikin_setpoint_ack", "erreur_adresse_inconnue");
-            return;
-        }
-        float nouvelle_consigne = atof(payload);
-        if(nouvelle_consigne >= 5.0f && nouvelle_consigne <= 40.0f) {
-            int16_t raw = (int16_t)(nouvelle_consigne * 10);
-            bool ok = modbus_write_register(g_daikin_addr, 231, raw);
-            dispatch_state_subtopic("daikin_setpoint_ack", ok ? "ok" : "erreur");
-        }
-    }
+    (void)topic;
+    (void)payload;
+    (void)source;
 }
