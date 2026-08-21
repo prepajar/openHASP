@@ -3,10 +3,30 @@
 // EKRTCTRL), intégré directement dans openHASP via son mécanisme officiel
 // de code personnalisé (HASP_USE_CUSTOM).
 //
-// Câblage : RS485 sur GPIO2 (TXD_EXT) / GPIO1 (RXD_EXT), 9600 bauds 8N1,
-// via la puce RS485 déjà présente sur la carte du panneau (transceiver à
-// direction automatique, confirmé par la datasheet WT32S3-86S - pas de
-// DE/RE à piloter en logiciel) -> bornier A/B de la carte Daikin.
+// Câblage : RS485 sur GPIO4 (TX) / GPIO5 (RX), 9600 bauds 8N1, via la puce
+// SP3485 déjà présente sur la carte du panneau (transceiver à direction
+// automatique piloté par transistor Q3, pas de DE/RE à piloter en
+// logiciel) -> bornier A/B de la carte Daikin.
+//
+// HISTORIQUE DES CORRECTIFS DE PINS (ne pas repartir dans une nouvelle
+// hypothèse de GPIO sans raison nouvelle - voir plus bas) :
+//   1) GPIO2/GPIO1 (board.h openHASP, positions module 39/40 selon la page
+//      vendeur) : config d'origine, jamais testée précisément à l'oscillo
+//      pour la présence d'un signal TX à l'époque.
+//   2) GPIO4/GPIO5 (lecture de l'encadré "IO MAP" du schéma officiel
+//      fabricant, net-labels TXD_IO/RXD_IO) : testée, AUCUN signal à
+//      l'oscillo sur A/B pendant l'émission.
+//   3) GPIO43/GPIO44 (pins natives "TXD"/"RXD" du module, position 33/34) :
+//      testée, AUCUN signal à l'oscillo sur A/B non plus.
+//   RETOUR À GPIO4/GPIO5, confirmé cette fois par INSPECTION PHYSIQUE
+//   DIRECTE du circuit imprimé par l'utilisateur (traçage des pistes au
+//   plus près de la puce SP3485, pas juste une lecture de schéma) - preuve
+//   la plus fiable obtenue jusqu'ici. Étant donné que GPIO4/GPIO5 avait
+//   déjà été testé électriquement à vide, le problème n'est donc
+//   probablement PAS le choix du GPIO mais un souci en aval, au niveau de
+//   la puce SP3485 elle-même ou du contrôle de direction DE/RE - à sonder
+//   directement sur les pattes du composant (VCC/GND, nœud DE/RE, DI)
+//   plutôt que de continuer à changer de pins ESP32.
 //
 // Registres Daikin utilisés (confirmés par le manuel officiel
 // EKWHCTRL1/EKRTCTRL1 Modbus RTU) :
@@ -28,8 +48,8 @@
 #include <HardwareSerial.h>
 
 // --- Configuration ---
-static const int MODBUS_TX_PIN     = 2;   // TXD_EXT
-static const int MODBUS_RX_PIN     = 1;   // RXD_EXT
+static const int MODBUS_TX_PIN     = 4;   // confirmé par inspection physique du PCB
+static const int MODBUS_RX_PIN     = 5;   // confirmé par inspection physique du PCB
 static const uint32_t MODBUS_BAUD  = 9600;
 
 // Adresses Modbus candidates à scanner tant que l'adresse réelle n'a pas
@@ -164,7 +184,7 @@ static bool modbus_write_register(uint8_t slave_addr, uint16_t reg, int16_t valu
 
 void custom_setup() {
     modbusSerial.begin(MODBUS_BAUD, SERIAL_8N1, MODBUS_RX_PIN, MODBUS_TX_PIN);
-    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO2=TX, GPIO1=RX, 9600 8N1)"));
+    Serial.println(F("[DAIKIN] Port Modbus RTU initialisé (GPIO4=TX, GPIO5=RX, 9600 8N1)"));
     Serial.println(F("[DAIKIN] Démarrage du scan d'adresses Modbus (1-16)..."));
 }
 
