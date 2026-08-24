@@ -133,12 +133,6 @@ static portMUX_TYPE g_sht20_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_temperature   = NAN;
 static float g_humidite      = NAN;
 static bool  g_sht20_present = false;
-// Mis à true par sht20_task() dès qu'une NOUVELLE lecture valide arrive, lu
-// (et remis à false) par custom_loop() pour pousser la valeur à l'écran
-// IMMÉDIATEMENT plutôt que d'attendre jusqu'à 5s le prochain
-// custom_every_5seconds() - cf explication détaillée plus bas (ESPlogs 12 :
-// affichage température/humidité très lent à apparaître).
-static volatile bool g_sht20_new_data = false;
 
 // =====================================================================
 // Driver SHT20 minimal (I2C via Wire, mode "no hold" avec délai fixe -
@@ -229,36 +223,29 @@ static bool sht20_get_humidity(float& out_rh, float last_valid) {
 // séparée, cf sht20_freeRTOA_task dans leur code) plutôt que de bloquer la
 // boucle principale d'openHASP qui gère aussi l'écran/le tactile. Ne touche
 // JAMAIS directement l'UI/LVGL depuis cette tâche (pas thread-safe) - se
-// contente d'écrire les valeurs partagées sous spinlock ; c'est custom_loop()
-// (immédiatement) et custom_every_5seconds() (périodiquement), exécutées
-// dans la boucle principale, qui lisent ces valeurs déjà prêtes et les
-// poussent vers l'écran.
+// contente d'écrire les valeurs partagées sous spinlock ; c'est
+// custom_every_5seconds(), exécutée dans la boucle principale, qui lit ces
+// valeurs déjà prêtes et les pousse vers l'écran.
 //
-// RETOUR TERRAIN (ESPlogs 12) - affichage température/humidité très lent :
-// deux causes distinctes identifiées, la 2e plus incertaine que la 1re.
-// 1) BUG CONFIRMÉ ET CORRIGÉ ICI : avant ce correctif, même quand cette
-//    tâche obtenait une lecture valide, rien ne la poussait à l'écran avant
-//    le prochain tic de custom_every_5seconds() (jusqu'à 5s de retard
-//    supplémentaire, cumulé à chaque cycle raté). Fix : le drapeau
-//    g_sht20_new_data ci-dessus, posé ici dès qu'une lecture réussit, lu et
-//    affiché immédiatement par custom_loop() (donc en quelques dizaines de
-//    ms, pas 5s).
-// 2) HYPOTHÈSE NON CONFIRMÉE (à surveiller) : le log montre aussi énormément
-//    d'échecs de lecture SHT20 (CRC/timeout) depuis le passage à cette tâche
-//    séparée - beaucoup plus qu'avant (ESPlogs 10/11, lecture encore
-//    bloquante dans la boucle principale, aucun échec observé). Cause
-//    plausible : le driver tactile FT6336U utilise le MÊME bus I2C
-//    (SDA=15/SCL=6) depuis le code officiel d'openHASP, potentiellement
-//    depuis un autre contexte d'exécution - une lecture tactile qui
-//    s'intercale au milieu d'une transaction SHT20 (write commande / attente
-//    / read résultat) la corromprait, exactement le symptôme observé. Je ne
-//    peux pas le confirmer à 100% sans voir le driver tactile de ce fork.
-//    Le retry plus rapide ci-dessous (1s au lieu de 5s après un échec)
-//    limite les dégâts en attendant, mais si le problème persiste ou
-//    s'aggrave, il faudra probablement soit ajouter un vrai verrou partagé
-//    avec le driver tactile (nécessite de modifier ce driver, hors de
-//    my_custom.cpp), soit revenir à une lecture synchrone dans la boucle
-//    principale (~114ms bloquants toutes les 5s - le compromis d'origine).
+// RETOUR TERRAIN (ESPlogs 13) - IMPORTANT, corrige une tentative précédente :
+// la version précédente de ce fichier appelait aussi update_dashboard_labels()
+// depuis custom_loop() (à chaque itération de la boucle principale) pour
+// afficher une nouvelle lecture SHT20 sans attendre le tic 5s suivant.
+// ESPlogs 13 a montré, juste après ce changement, des redémarrages en
+// boucle avec panics "Guru Meditation" (StoreProhibited/LoadProhibited/
+// IllegalInstruction, Core 0 ET Core 1) dès le boot - un symptôme de
+// corruption mémoire. Ce comportement n'existait dans AUCUN log précédent
+// (ESPlogs 10/11/12, tous stables). Je n'ai pas pu identifier la ligne
+// fautive exacte avec certitude (pas de fichier .elf/.map pour décoder les
+// adresses du backtrace, et le driver tactile/LVGL de ce fork n'est pas
+// dans ce fichier) - mais la corrélation temporelle avec CE changement est
+// trop nette pour l'ignorer. Par prudence, l'appel à update_dashboard_labels()
+// depuis custom_loop() a été RETIRÉ (custom_loop() est de nouveau vide) -
+// on revient à l'architecture éprouvée (stable sur ESPlogs 10/11/12) où
+// seule custom_every_5seconds() pousse l'affichage, au prix d'un délai
+// jusqu'à 5s après une lecture réussie. Seul le retry plus rapide en cas
+// d'échec (1s au lieu de 5s, ci-dessous) est conservé - un simple délai,
+// beaucoup plus sûr.
 // =====================================================================
 static void sht20_task(void* pvParameters) {
     for (;;) {
@@ -292,9 +279,8 @@ static void sht20_task(void* pvParameters) {
 
         if (ok_t && ok_h) {
             portENTER_CRITICAL(&g_sht20_mux);
-            g_temperature   = t + TEMP_CALIBRATION_OFFSET;
-            g_humidite      = h;
-            g_sht20_new_data = true; // custom_loop() l'affichera dès la prochaine itération
+            g_temperature = t + TEMP_CALIBRATION_OFFSET;
+            g_humidite    = h;
             portEXIT_CRITICAL(&g_sht20_mux);
             Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", t + TEMP_CALIBRATION_OFFSET, h);
 
@@ -403,18 +389,12 @@ void custom_setup() {
 }
 
 void custom_loop() {
-    // Appelée à chaque itération de la boucle principale (donc très souvent,
-    // pas juste toutes les 5s) - sert uniquement à repérer et afficher SANS
-    // DÉLAI une nouvelle lecture SHT20 fraîchement posée par sht20_task(),
-    // au lieu d'attendre le prochain tic de custom_every_5seconds() (jusqu'à
-    // 5s de retard supplémentaire - cause probable de la lenteur observée).
-    bool has_new_data;
-    portENTER_CRITICAL(&g_sht20_mux);
-    has_new_data = g_sht20_new_data;
-    g_sht20_new_data = false;
-    portEXIT_CRITICAL(&g_sht20_mux);
-
-    if (has_new_data) update_dashboard_labels();
+    // Volontairement vide - cf commentaire au-dessus de sht20_task() : un
+    // essai précédent affichait ici les nouvelles lectures SHT20 sans délai,
+    // mais a coïncidé avec des redémarrages en boucle (ESPlogs 13). Revenu à
+    // une boucle principale qui ne fait rien de plus que ce qui a été
+    // prouvé stable ; l'affichage se fait uniquement dans
+    // custom_every_5seconds().
 }
 
 void custom_every_second() {
