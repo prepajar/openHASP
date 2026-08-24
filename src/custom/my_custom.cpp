@@ -133,6 +133,12 @@ static portMUX_TYPE g_sht20_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_temperature   = NAN;
 static float g_humidite      = NAN;
 static bool  g_sht20_present = false;
+// Mis à true par sht20_task() dès qu'une NOUVELLE lecture valide arrive, lu
+// (et remis à false) par custom_loop() pour pousser la valeur à l'écran
+// IMMÉDIATEMENT plutôt que d'attendre jusqu'à 5s le prochain
+// custom_every_5seconds() - cf explication détaillée plus bas (ESPlogs 12 :
+// affichage température/humidité très lent à apparaître).
+static volatile bool g_sht20_new_data = false;
 
 // =====================================================================
 // Driver SHT20 minimal (I2C via Wire, mode "no hold" avec délai fixe -
@@ -223,9 +229,36 @@ static bool sht20_get_humidity(float& out_rh, float last_valid) {
 // séparée, cf sht20_freeRTOA_task dans leur code) plutôt que de bloquer la
 // boucle principale d'openHASP qui gère aussi l'écran/le tactile. Ne touche
 // JAMAIS directement l'UI/LVGL depuis cette tâche (pas thread-safe) - se
-// contente d'écrire les valeurs partagées sous spinlock ; c'est
-// custom_every_5seconds(), exécutée dans la boucle principale, qui lit ces
-// valeurs déjà prêtes et les pousse vers l'écran.
+// contente d'écrire les valeurs partagées sous spinlock ; c'est custom_loop()
+// (immédiatement) et custom_every_5seconds() (périodiquement), exécutées
+// dans la boucle principale, qui lisent ces valeurs déjà prêtes et les
+// poussent vers l'écran.
+//
+// RETOUR TERRAIN (ESPlogs 12) - affichage température/humidité très lent :
+// deux causes distinctes identifiées, la 2e plus incertaine que la 1re.
+// 1) BUG CONFIRMÉ ET CORRIGÉ ICI : avant ce correctif, même quand cette
+//    tâche obtenait une lecture valide, rien ne la poussait à l'écran avant
+//    le prochain tic de custom_every_5seconds() (jusqu'à 5s de retard
+//    supplémentaire, cumulé à chaque cycle raté). Fix : le drapeau
+//    g_sht20_new_data ci-dessus, posé ici dès qu'une lecture réussit, lu et
+//    affiché immédiatement par custom_loop() (donc en quelques dizaines de
+//    ms, pas 5s).
+// 2) HYPOTHÈSE NON CONFIRMÉE (à surveiller) : le log montre aussi énormément
+//    d'échecs de lecture SHT20 (CRC/timeout) depuis le passage à cette tâche
+//    séparée - beaucoup plus qu'avant (ESPlogs 10/11, lecture encore
+//    bloquante dans la boucle principale, aucun échec observé). Cause
+//    plausible : le driver tactile FT6336U utilise le MÊME bus I2C
+//    (SDA=15/SCL=6) depuis le code officiel d'openHASP, potentiellement
+//    depuis un autre contexte d'exécution - une lecture tactile qui
+//    s'intercale au milieu d'une transaction SHT20 (write commande / attente
+//    / read résultat) la corromprait, exactement le symptôme observé. Je ne
+//    peux pas le confirmer à 100% sans voir le driver tactile de ce fork.
+//    Le retry plus rapide ci-dessous (1s au lieu de 5s après un échec)
+//    limite les dégâts en attendant, mais si le problème persiste ou
+//    s'aggrave, il faudra probablement soit ajouter un vrai verrou partagé
+//    avec le driver tactile (nécessite de modifier ce driver, hors de
+//    my_custom.cpp), soit revenir à une lecture synchrone dans la boucle
+//    principale (~114ms bloquants toutes les 5s - le compromis d'origine).
 // =====================================================================
 static void sht20_task(void* pvParameters) {
     for (;;) {
@@ -259,19 +292,22 @@ static void sht20_task(void* pvParameters) {
 
         if (ok_t && ok_h) {
             portENTER_CRITICAL(&g_sht20_mux);
-            g_temperature = t + TEMP_CALIBRATION_OFFSET;
-            g_humidite    = h;
+            g_temperature   = t + TEMP_CALIBRATION_OFFSET;
+            g_humidite      = h;
+            g_sht20_new_data = true; // custom_loop() l'affichera dès la prochaine itération
             portEXIT_CRITICAL(&g_sht20_mux);
             Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", t + TEMP_CALIBRATION_OFFSET, h);
+
+            vTaskDelay(pdMS_TO_TICKS(5000)); // lecture réussie : cadence normale
         } else {
             Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
                           ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
             portENTER_CRITICAL(&g_sht20_mux);
             g_sht20_present = false; // on retentera un probe complet au prochain cycle
             portEXIT_CRITICAL(&g_sht20_mux);
-        }
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(1000)); // échec : on retente vite plutôt que d'attendre 5s
+        }
     }
 }
 
@@ -367,8 +403,18 @@ void custom_setup() {
 }
 
 void custom_loop() {
-    // rien ici - la lecture SHT20 tourne dans sa propre tâche (sht20_task),
-    // l'affichage se fait dans custom_every_5seconds()
+    // Appelée à chaque itération de la boucle principale (donc très souvent,
+    // pas juste toutes les 5s) - sert uniquement à repérer et afficher SANS
+    // DÉLAI une nouvelle lecture SHT20 fraîchement posée par sht20_task(),
+    // au lieu d'attendre le prochain tic de custom_every_5seconds() (jusqu'à
+    // 5s de retard supplémentaire - cause probable de la lenteur observée).
+    bool has_new_data;
+    portENTER_CRITICAL(&g_sht20_mux);
+    has_new_data = g_sht20_new_data;
+    g_sht20_new_data = false;
+    portEXIT_CRITICAL(&g_sht20_mux);
+
+    if (has_new_data) update_dashboard_labels();
 }
 
 void custom_every_second() {
