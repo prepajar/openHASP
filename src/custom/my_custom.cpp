@@ -50,6 +50,39 @@
 
 #include "my_custom.h"
 #include <Wire.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <string.h>
+#include <math.h>
+
+// =====================================================================
+// MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
+// sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
+// restent RÉELLES (capteur SHT20 déjà confirmé fonctionnel ci-dessous) ;
+// vitesse ventilo et programme de flux d'air sont des valeurs FICTIVES qui
+// varient toutes seules pour vérifier que l'écran affiche bien du contenu
+// dynamique. À retirer/remplacer par les vraies valeurs reçues en CAN une
+// fois l'ESP32 secondaire câblé (cf mémoire du projet).
+// =====================================================================
+#define SIMULATION_MODE 1
+
+// --- Adressage des objets du dashboard (pages.jsonl livré à part) ---
+// p1b2=humidité, p1b3=température, p1b5=consigne, p1b9=vitesse simulée,
+// p1b11=programme simulé. Page 2 = confirmation réinitialisation WiFi.
+// À AJUSTER ICI si tu changes les id dans pages.jsonl.
+
+// --- Consigne utilisateur (stockée en NVS pour survivre à un reboot) ---
+static Preferences prefs;
+static float g_consigne = 20.0f;
+static const float CONSIGNE_MIN = 5.0f;
+static const float CONSIGNE_MAX = 30.0f;
+static const float CONSIGNE_STEP = 0.5f;
+
+// --- Valeurs simulées (mode simulation uniquement) ---
+static float   g_sim_vitesse = 0.0f;
+static uint8_t g_sim_prog_index = 0;
+static const char* SIM_PROGRAMMES[] = { "Horizontal", "Oscillant", "Vertical" };
+static const uint8_t SIM_PROGRAMMES_COUNT = 3;
 
 // --- Configuration I2C (identique au bus tactile FT6336U déjà initialisé
 // par le driver tactile officiel d'openHASP - on réutilise le même bus,
@@ -61,6 +94,15 @@ static const uint8_t  SHT20_ADDR = 0x40;
 
 static const uint8_t SHT20_CMD_TEMP_NOHOLD = 0xF3;
 static const uint8_t SHT20_CMD_HUM_NOHOLD  = 0xF5;
+
+// Correction d'auto-échauffement : le capteur est sur le même PCB que le
+// rétroéclairage/ESP32/WiFi, il lit donc plus chaud que l'air ambiant une
+// fois le panneau chaud (observé sur ESPlogs 9 : dérive continue à la mise
+// sous tension). À calibrer : une fois le panneau stabilisé (15-20 min),
+// comparer avec un thermomètre de référence et ajuster cette constante
+// (ex. si le capteur affiche 31.5°C pour une vraie ambiante à 29.0°C,
+// mettre -2.5f). Laissé à 0 tant que la mesure de référence n'est pas faite.
+static const float TEMP_CALIBRATION_OFFSET = 0.0f;
 
 // --- État courant (mis à jour périodiquement) ---
 static float g_temperature   = NAN;
@@ -78,9 +120,24 @@ static bool sht20_probe() {
     return (Wire.endTransmission() == 0);
 }
 
+// CRC8 Sensirion (poly 0x31, init 0x00) - vérifie l'intégrité des 2 octets
+// de donnée reçus contre le 3e octet renvoyé par le capteur. Rejette les
+// lectures corrompues par un glitch I2C plutôt que de les afficher.
+static uint8_t sht20_crc8(uint8_t msb, uint8_t lsb) {
+    uint8_t data[2] = { msb, lsb };
+    uint8_t crc = 0x00;
+    for (uint8_t b = 0; b < 2; b++) {
+        crc ^= data[b];
+        for (uint8_t i = 0; i < 8; i++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 // Lance une mesure (commande "no hold") et lit le résultat brut 16 bits
-// après le délai de conversion requis. Retourne true si succès (ACK reçu
-// à l'écriture ET aux 2 octets de données lus).
+// après le délai de conversion requis. Retourne true si succès (ACK reçu,
+// 3 octets reçus ET CRC valide).
 static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
     Wire.beginTransmission(SHT20_ADDR);
     Wire.write(cmd);
@@ -89,28 +146,80 @@ static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
     delay(delay_ms);
 
     uint8_t received = Wire.requestFrom((int)SHT20_ADDR, 3);
-    if (received < 2) return false; // pas assez d'octets reçus
+    if (received < 3) return false; // pas assez d'octets reçus (CRC inclus)
 
     uint8_t msb = Wire.read();
     uint8_t lsb = Wire.read();
-    if (received >= 3) Wire.read(); // octet CRC - lu mais non vérifié
+    uint8_t crc = Wire.read();
+
+    if (sht20_crc8(msb, lsb) != crc) {
+        Serial.println(F("[SHT20] CRC invalide - lecture ignorée (glitch I2C)"));
+        return false;
+    }
 
     raw_out = ((uint16_t)msb << 8) | (lsb & 0xFC); // 2 bits de statut à ignorer
     return true;
 }
 
+// Filtre anti-saut : rejette une valeur qui varierait de façon aberrante
+// par rapport à la dernière lecture valide (cycle de 5s -> un vrai
+// changement aussi rapide est physiquement impossible pour de l'air
+// ambiant, donc c'est forcément un résidu de glitch non détecté par le CRC).
+static const float MAX_DELTA_TEMP = 3.0f;  // °C entre 2 lectures consécutives
+static const float MAX_DELTA_HUM  = 10.0f; // %RH entre 2 lectures consécutives
+
 static bool sht20_get_temperature(float& out_c) {
     uint16_t raw;
     if (!sht20_read_raw(SHT20_CMD_TEMP_NOHOLD, 85, raw)) return false;
-    out_c = 175.72f * ((float)raw / 65536.0f) - 46.85f;
+    float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
+    if (!isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP) {
+        Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", g_temperature, t);
+        return false;
+    }
+    out_c = t;
     return true;
 }
 
 static bool sht20_get_humidity(float& out_rh) {
     uint16_t raw;
     if (!sht20_read_raw(SHT20_CMD_HUM_NOHOLD, 29, raw)) return false;
-    out_rh = 125.0f * ((float)raw / 65536.0f) - 6.0f;
+    float h = 125.0f * ((float)raw / 65536.0f) - 6.0f;
+    if (!isnan(g_humidite) && fabsf(h - g_humidite) > MAX_DELTA_HUM) {
+        Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", g_humidite, h);
+        return false;
+    }
+    out_rh = h;
     return true;
+}
+
+// =====================================================================
+// Mise à jour des labels du dashboard (pages.jsonl)
+// Utilise dispatch_text_line(), le point d'entrée officiel openHASP pour
+// injecter une commande "pXbY.attribut=valeur" depuis du code custom -
+// exactement comme si la commande arrivait par MQTT, mais 100% locale.
+// =====================================================================
+static void update_dashboard_labels() {
+    char buf[48];
+
+    if (!isnan(g_temperature)) {
+        snprintf(buf, sizeof(buf), "p1b3.text=%.1f °C", g_temperature);
+        dispatch_text_line(buf, TAG_CUSTOM);
+    }
+    if (!isnan(g_humidite)) {
+        snprintf(buf, sizeof(buf), "p1b2.text=%.0f %%", g_humidite);
+        dispatch_text_line(buf, TAG_CUSTOM);
+    }
+
+    snprintf(buf, sizeof(buf), "p1b5.text=%.1f °C", g_consigne);
+    dispatch_text_line(buf, TAG_CUSTOM);
+
+#if SIMULATION_MODE
+    snprintf(buf, sizeof(buf), "p1b9.text=%.0f %%", g_sim_vitesse);
+    dispatch_text_line(buf, TAG_CUSTOM);
+
+    snprintf(buf, sizeof(buf), "p1b11.text=%s", SIM_PROGRAMMES[g_sim_prog_index]);
+    dispatch_text_line(buf, TAG_CUSTOM);
+#endif
 }
 
 // =====================================================================
@@ -131,6 +240,15 @@ void custom_setup() {
     } else {
         Serial.println(F("[SHT20] AUCUN capteur détecté à l'adresse 0x40 - vérifier que la puce est bien montée sur ce panneau"));
     }
+
+    // Consigne : rechargée depuis la NVS (survit à un reboot/reflash tant
+    // que la partition NVS n'est pas effacée), sinon valeur par défaut 20°C.
+    prefs.begin("daikin", false);
+    g_consigne = prefs.getFloat("consigne", 20.0f);
+
+    // Premier affichage du dashboard au boot (avant la première lecture
+    // SHT20 à 5s, pour éviter un écran vide pendant les premières secondes).
+    update_dashboard_labels();
 }
 
 void custom_loop() {
@@ -158,23 +276,40 @@ void custom_every_5seconds() {
     bool ok_t = sht20_get_temperature(t);
     bool ok_h = sht20_get_humidity(h);
 
-    if (ok_t) g_temperature = t;
+    if (ok_t) g_temperature = t + TEMP_CALIBRATION_OFFSET;
     if (ok_h) g_humidite    = h;
 
     if (ok_t && ok_h) {
         Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", g_temperature, g_humidite);
 
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", g_temperature);
-        dispatch_state_subtopic("temperature", buf);
+        char pubbuf[16];
+        snprintf(pubbuf, sizeof(pubbuf), "%.1f", g_temperature);
+        dispatch_state_subtopic("temperature", pubbuf);
 
-        snprintf(buf, sizeof(buf), "%.1f", g_humidite);
-        dispatch_state_subtopic("humidite", buf);
+        snprintf(pubbuf, sizeof(pubbuf), "%.1f", g_humidite);
+        dispatch_state_subtopic("humidite", pubbuf);
     } else {
         Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
                       ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
         g_sht20_present = false; // on retentera un probe complet au prochain cycle
     }
+
+#if SIMULATION_MODE
+    // Vitesse ventilo simulée : oscille doucement entre 20% et 80% (onde
+    // sinus lente sur millis(), rien à voir avec un vrai capteur/moteur).
+    float phase = (float)(millis() % 60000) / 60000.0f * 2.0f * (float)PI;
+    g_sim_vitesse = 50.0f + 30.0f * sinf(phase);
+
+    // Programme de flux d'air simulé : change toutes les ~10s pour bien
+    // voir le label bouger pendant le test.
+    static uint32_t last_prog_change = 0;
+    if (millis() - last_prog_change > 10000) {
+        g_sim_prog_index = (g_sim_prog_index + 1) % SIM_PROGRAMMES_COUNT;
+        last_prog_change = millis();
+    }
+#endif
+
+    update_dashboard_labels();
 }
 
 bool custom_pin_in_use(uint8_t pin) {
@@ -199,10 +334,50 @@ void custom_get_sensors(JsonDocument& doc) {
     sensor[F("present")]     = g_sht20_present;
 }
 
-// Réservé pour de futures commandes MQTT entrantes - rien pour l'instant
-// côté température/humidité (lecture seule), mais la fonction doit exister.
+// Reçoit les commandes envoyées vers le topic "custom" - déclenchées soit
+// par MQTT (hasp/<plate>/command/custom), soit localement par un bouton
+// pages.jsonl avec "action":{"up":"custom <commande>"} (mécanisme d'action
+// locale documenté par openHASP, exécuté sans MQTT/broker).
+//
+// IMPORTANT - à vérifier au premier flash : le routage exact d'une action
+// bouton locale vers ce hook n'est pas garanti à 100% par la documentation
+// publique openHASP (elle documente le mécanisme "action" des boutons et
+// séparément ce hook "custom_topic_payload" pour les messages MQTT, sans
+// confirmer explicitement que les deux passent par le même chemin). Si les
+// boutons +/- ou la réinitialisation WiFi ne réagissent pas au toucher,
+// regarde les logs série au moment du clic : si rien ne s'affiche ici,
+// c'est que l'action locale ne route pas vers custom_topic_payload sur ta
+// version d'openHASP - dis-le moi avec le log et j'ajuste (probablement en
+// passant par dispatch_text_line() direct depuis pages.jsonl, ou un autre
+// hook de ton fork).
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
-    (void)topic;
-    (void)payload;
     (void)source;
+
+    if (strcmp(topic, "custom") != 0) return;
+
+    Serial.printf("[custom] Commande reçue : %s\n", payload);
+
+    if (strcmp(payload, "consigne_plus") == 0) {
+        g_consigne += CONSIGNE_STEP;
+        if (g_consigne > CONSIGNE_MAX) g_consigne = CONSIGNE_MAX;
+        prefs.putFloat("consigne", g_consigne);
+        update_dashboard_labels();
+
+    } else if (strcmp(payload, "consigne_moins") == 0) {
+        g_consigne -= CONSIGNE_STEP;
+        if (g_consigne < CONSIGNE_MIN) g_consigne = CONSIGNE_MIN;
+        prefs.putFloat("consigne", g_consigne);
+        update_dashboard_labels();
+
+    } else if (strcmp(payload, "wifi_reset_confirm") == 0) {
+        // Efface les identifiants WiFi stockés (NVS) et redémarre : openHASP
+        // se retrouve sans réseau connu et rouvre son portail de config
+        // (point d'accès + captive portal) au boot suivant - pas besoin de
+        // reflasher pour changer de réseau WiFi.
+        Serial.println(F("[custom] Réinitialisation WiFi demandée - redémarrage en mode config..."));
+        delay(300);
+        WiFi.disconnect(true, true);
+        delay(300);
+        ESP.restart();
+    }
 }
