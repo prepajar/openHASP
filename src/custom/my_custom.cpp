@@ -52,6 +52,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <ArduinoJson.h>
 #include <string.h>
 #include <math.h>
 
@@ -67,8 +68,11 @@
 #define SIMULATION_MODE 1
 
 // --- Adressage des objets du dashboard (pages.jsonl livré à part) ---
-// p1b2=humidité, p1b3=température, p1b5=consigne, p1b9=vitesse simulée,
-// p1b11=programme simulé. Page 2 = confirmation réinitialisation WiFi.
+// Page 1 : p1b2=humidité, p1b3=température, p1b5=consigne, p1b9=vitesse
+// affichée, p1b11=programme/position affiché(e), p1b13=bouton "Regl." (page 3).
+// Page 2 : confirmation réinitialisation WiFi.
+// Page 3 : p3b3=sélecteur vitesse Auto/Manuel, p3b5=valeur vitesse manuelle,
+// p3b6/p3b7=boutons -/+ vitesse manuelle, p3b9=sélecteur volet Auto/Fixe/Swing.
 // À AJUSTER ICI si tu changes les id dans pages.jsonl.
 
 // --- Consigne utilisateur (stockée en NVS pour survivre à un reboot) ---
@@ -77,6 +81,20 @@ static float g_consigne = 20.0f;
 static const float CONSIGNE_MIN = 5.0f;
 static const float CONSIGNE_MAX = 30.0f;
 static const float CONSIGNE_STEP = 0.5f;
+
+// --- Réglages vitesse ventilo / position volet (page 3 de pages.jsonl) ---
+// "Auto" = calculé automatiquement (pour l'instant simulation - deviendra une
+// vraie régulation une fois l'ESP32 secondaire/CAN câblé) ; "Manuel"/"Fixe"/
+// "Swing" = valeur imposée par l'utilisateur via les sélecteurs de la page 3.
+// Stockés en NVS comme la consigne, pour survivre à un reboot.
+static bool    g_vitesse_manuelle_active = false; // false=Auto, true=Manuel
+static float   g_vitesse_manuelle        = 50.0f; // % choisi en mode Manuel
+static const float VITESSE_MANUELLE_STEP = 5.0f;
+static const float VITESSE_MANUELLE_MIN  = 0.0f;
+static const float VITESSE_MANUELLE_MAX  = 100.0f;
+
+enum VoletMode : uint8_t { VOLET_AUTO = 0, VOLET_FIXE = 1, VOLET_SWING = 2 };
+static uint8_t g_volet_mode = VOLET_AUTO;
 
 // --- Valeurs simulées (mode simulation uniquement) ---
 static float   g_sim_vitesse = 0.0f;
@@ -97,14 +115,21 @@ static const uint8_t SHT20_CMD_HUM_NOHOLD  = 0xF5;
 
 // Correction d'auto-échauffement : le capteur est sur le même PCB que le
 // rétroéclairage/ESP32/WiFi, il lit donc plus chaud que l'air ambiant une
-// fois le panneau chaud (observé sur ESPlogs 9 : dérive continue à la mise
-// sous tension). À calibrer : une fois le panneau stabilisé (15-20 min),
+// fois le panneau chaud (observé sur ESPlogs 9 ET reconfirmé sur ESPlogs
+// 10/11 : dérive continue de 33.3°C à 34.7°C+ en quelques minutes, et
+// l'utilisateur confirme que la valeur affichée est trop élevée par rapport
+// à la réalité). À calibrer : une fois le panneau stabilisé (15-20 min),
 // comparer avec un thermomètre de référence et ajuster cette constante
 // (ex. si le capteur affiche 31.5°C pour une vraie ambiante à 29.0°C,
-// mettre -2.5f). Laissé à 0 tant que la mesure de référence n'est pas faite.
+// mettre -2.5f). Laissé à 0 tant que la mesure de référence n'est pas faite -
+// calibration reportée volontairement à plus tard (confirmé par l'utilisateur).
 static const float TEMP_CALIBRATION_OFFSET = 0.0f;
 
 // --- État courant (mis à jour périodiquement) ---
+// Partagé entre la tâche de fond SHT20 (qui écrit) et la boucle principale
+// openHASP (qui lit pour rafraîchir l'écran) - protégé par un spinlock léger
+// (portMUX) plutôt qu'un mutex complet, suffisant pour de simples float/bool.
+static portMUX_TYPE g_sht20_mux = portMUX_INITIALIZER_UNLOCKED;
 static float g_temperature   = NAN;
 static float g_humidite      = NAN;
 static bool  g_sht20_present = false;
@@ -168,28 +193,86 @@ static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
 static const float MAX_DELTA_TEMP = 3.0f;  // °C entre 2 lectures consécutives
 static const float MAX_DELTA_HUM  = 10.0f; // %RH entre 2 lectures consécutives
 
-static bool sht20_get_temperature(float& out_c) {
+static bool sht20_get_temperature(float& out_c, float last_valid) {
     uint16_t raw;
     if (!sht20_read_raw(SHT20_CMD_TEMP_NOHOLD, 85, raw)) return false;
     float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
-    if (!isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP) {
-        Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", g_temperature, t);
+    if (!isnan(last_valid) && fabsf(t - last_valid) > MAX_DELTA_TEMP) {
+        Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", last_valid, t);
         return false;
     }
     out_c = t;
     return true;
 }
 
-static bool sht20_get_humidity(float& out_rh) {
+static bool sht20_get_humidity(float& out_rh, float last_valid) {
     uint16_t raw;
     if (!sht20_read_raw(SHT20_CMD_HUM_NOHOLD, 29, raw)) return false;
     float h = 125.0f * ((float)raw / 65536.0f) - 6.0f;
-    if (!isnan(g_humidite) && fabsf(h - g_humidite) > MAX_DELTA_HUM) {
-        Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", g_humidite, h);
+    if (!isnan(last_valid) && fabsf(h - last_valid) > MAX_DELTA_HUM) {
+        Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", last_valid, h);
         return false;
     }
     out_rh = h;
     return true;
+}
+
+// =====================================================================
+// Tâche de fond dédiée à la lecture SHT20 (I2C + délais bloquants 85/29ms)
+// - reproduit le pattern du firmware fabricant d'origine (tâche FreeRTOS
+// séparée, cf sht20_freeRTOA_task dans leur code) plutôt que de bloquer la
+// boucle principale d'openHASP qui gère aussi l'écran/le tactile. Ne touche
+// JAMAIS directement l'UI/LVGL depuis cette tâche (pas thread-safe) - se
+// contente d'écrire les valeurs partagées sous spinlock ; c'est
+// custom_every_5seconds(), exécutée dans la boucle principale, qui lit ces
+// valeurs déjà prêtes et les pousse vers l'écran.
+// =====================================================================
+static void sht20_task(void* pvParameters) {
+    for (;;) {
+        bool present;
+        portENTER_CRITICAL(&g_sht20_mux);
+        present = g_sht20_present;
+        portEXIT_CRITICAL(&g_sht20_mux);
+
+        if (!present) {
+            present = sht20_probe();
+            portENTER_CRITICAL(&g_sht20_mux);
+            g_sht20_present = present;
+            if (!present) { g_temperature = NAN; g_humidite = NAN; }
+            portEXIT_CRITICAL(&g_sht20_mux);
+            if (!present) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+            Serial.println(F("[SHT20] Capteur détecté (nouvelle tentative)"));
+        }
+
+        float last_t, last_h;
+        portENTER_CRITICAL(&g_sht20_mux);
+        last_t = g_temperature;
+        last_h = g_humidite;
+        portEXIT_CRITICAL(&g_sht20_mux);
+
+        float t, h;
+        bool ok_t = sht20_get_temperature(t, last_t);
+        bool ok_h = sht20_get_humidity(h, last_h);
+
+        if (ok_t && ok_h) {
+            portENTER_CRITICAL(&g_sht20_mux);
+            g_temperature = t + TEMP_CALIBRATION_OFFSET;
+            g_humidite    = h;
+            portEXIT_CRITICAL(&g_sht20_mux);
+            Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", t + TEMP_CALIBRATION_OFFSET, h);
+        } else {
+            Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
+                          ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
+            portENTER_CRITICAL(&g_sht20_mux);
+            g_sht20_present = false; // on retentera un probe complet au prochain cycle
+            portEXIT_CRITICAL(&g_sht20_mux);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
 // =====================================================================
@@ -201,12 +284,20 @@ static bool sht20_get_humidity(float& out_rh) {
 static void update_dashboard_labels() {
     char buf[48];
 
-    if (!isnan(g_temperature)) {
-        snprintf(buf, sizeof(buf), "p1b3.text=%.1f °C", g_temperature);
+    // Snapshot rapide des valeurs partagées avec la tâche de fond SHT20
+    // (juste une copie sous spinlock, aucun accès I2C ici).
+    float temp_snapshot, hum_snapshot;
+    portENTER_CRITICAL(&g_sht20_mux);
+    temp_snapshot = g_temperature;
+    hum_snapshot  = g_humidite;
+    portEXIT_CRITICAL(&g_sht20_mux);
+
+    if (!isnan(temp_snapshot)) {
+        snprintf(buf, sizeof(buf), "p1b3.text=%.1f °C", temp_snapshot);
         dispatch_text_line(buf, TAG_CUSTOM);
     }
-    if (!isnan(g_humidite)) {
-        snprintf(buf, sizeof(buf), "p1b2.text=%.0f %%", g_humidite);
+    if (!isnan(hum_snapshot)) {
+        snprintf(buf, sizeof(buf), "p1b2.text=%.0f %%", hum_snapshot);
         dispatch_text_line(buf, TAG_CUSTOM);
     }
 
@@ -214,10 +305,26 @@ static void update_dashboard_labels() {
     dispatch_text_line(buf, TAG_CUSTOM);
 
 #if SIMULATION_MODE
-    snprintf(buf, sizeof(buf), "p1b9.text=%.0f %%", g_sim_vitesse);
+    // Vitesse affichée : la valeur manuelle si l'utilisateur a choisi "Manuel"
+    // sur la page 3, sinon la simulation "Auto" habituelle (sinusoïde).
+    snprintf(buf, sizeof(buf), "p1b9.text=%.0f %%",
+             g_vitesse_manuelle_active ? g_vitesse_manuelle : g_sim_vitesse);
     dispatch_text_line(buf, TAG_CUSTOM);
 
-    snprintf(buf, sizeof(buf), "p1b11.text=%s", SIM_PROGRAMMES[g_sim_prog_index]);
+    // Position du volet affichée : Fixe/Swing si choisi explicitement, sinon
+    // le cycle de simulation habituel en mode "Auto".
+    const char* volet_text;
+    switch (g_volet_mode) {
+        case VOLET_FIXE:  volet_text = "Fixe";      break;
+        case VOLET_SWING: volet_text = "Oscillant"; break;
+        default:          volet_text = SIM_PROGRAMMES[g_sim_prog_index]; break; // VOLET_AUTO
+    }
+    snprintf(buf, sizeof(buf), "p1b11.text=%s", volet_text);
+    dispatch_text_line(buf, TAG_CUSTOM);
+
+    // Réglages page 3 : valeur manuelle toujours affichée là-bas, qu'elle soit
+    // active ou non (sert de pré-réglage prêt à activer).
+    snprintf(buf, sizeof(buf), "p3b5.text=%.0f %%", g_vitesse_manuelle);
     dispatch_text_line(buf, TAG_CUSTOM);
 #endif
 }
@@ -241,10 +348,18 @@ void custom_setup() {
         Serial.println(F("[SHT20] AUCUN capteur détecté à l'adresse 0x40 - vérifier que la puce est bien montée sur ce panneau"));
     }
 
+    // Lecture I2C (bloquante ~114ms/cycle) déportée dans sa propre tâche
+    // FreeRTOS, pour ne jamais bloquer la boucle principale qui gère aussi
+    // l'écran/le tactile (cause probable de la lenteur observée en v3.0).
+    xTaskCreate(sht20_task, "sht20_task", 4096, NULL, 1, NULL);
+
     // Consigne : rechargée depuis la NVS (survit à un reboot/reflash tant
     // que la partition NVS n'est pas effacée), sinon valeur par défaut 20°C.
     prefs.begin("daikin", false);
-    g_consigne = prefs.getFloat("consigne", 20.0f);
+    g_consigne                = prefs.getFloat("consigne", 20.0f);
+    g_vitesse_manuelle_active = prefs.getBool("vit_man_on", false);
+    g_vitesse_manuelle        = prefs.getFloat("vit_man_val", 50.0f);
+    g_volet_mode              = prefs.getUChar("volet_mode", VOLET_AUTO);
 
     // Premier affichage du dashboard au boot (avant la première lecture
     // SHT20 à 5s, pour éviter un écran vide pendant les premières secondes).
@@ -252,46 +367,32 @@ void custom_setup() {
 }
 
 void custom_loop() {
-    // rien ici - la lecture se fait dans custom_every_5seconds()
+    // rien ici - la lecture SHT20 tourne dans sa propre tâche (sht20_task),
+    // l'affichage se fait dans custom_every_5seconds()
 }
 
 void custom_every_second() {
     // pas utilisé pour l'instant
 }
 
+// Exécutée dans la boucle principale d'openHASP (celle qui gère aussi
+// l'écran/le tactile) - ne doit JAMAIS bloquer. Ne fait plus aucun accès
+// I2C : elle se contente de publier l'état déjà lu par sht20_task() et de
+// faire avancer les valeurs simulées.
 void custom_every_5seconds() {
-    if (!g_sht20_present) {
-        // Nouvelle tentative périodique, au cas où le capteur n'était pas
-        // encore prêt au boot (faux négatif) - sans bloquer le reste.
-        g_sht20_present = sht20_probe();
-        if (!g_sht20_present) {
-            g_temperature = NAN;
-            g_humidite    = NAN;
-            return;
-        }
-        Serial.println(F("[SHT20] Capteur détecté (nouvelle tentative)"));
-    }
+    float temp_snapshot, hum_snapshot;
+    portENTER_CRITICAL(&g_sht20_mux);
+    temp_snapshot = g_temperature;
+    hum_snapshot  = g_humidite;
+    portEXIT_CRITICAL(&g_sht20_mux);
 
-    float t, h;
-    bool ok_t = sht20_get_temperature(t);
-    bool ok_h = sht20_get_humidity(h);
-
-    if (ok_t) g_temperature = t + TEMP_CALIBRATION_OFFSET;
-    if (ok_h) g_humidite    = h;
-
-    if (ok_t && ok_h) {
-        Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", g_temperature, g_humidite);
-
+    if (!isnan(temp_snapshot) && !isnan(hum_snapshot)) {
         char pubbuf[16];
-        snprintf(pubbuf, sizeof(pubbuf), "%.1f", g_temperature);
+        snprintf(pubbuf, sizeof(pubbuf), "%.1f", temp_snapshot);
         dispatch_state_subtopic("temperature", pubbuf);
 
-        snprintf(pubbuf, sizeof(pubbuf), "%.1f", g_humidite);
+        snprintf(pubbuf, sizeof(pubbuf), "%.1f", hum_snapshot);
         dispatch_state_subtopic("humidite", pubbuf);
-    } else {
-        Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
-                      ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
-        g_sht20_present = false; // on retentera un probe complet au prochain cycle
     }
 
 #if SIMULATION_MODE
@@ -319,57 +420,110 @@ bool custom_pin_in_use(uint8_t pin) {
     return false;
 }
 
-// Point d'accroche appelé PAR le noyau openHASP lorsqu'un état est publié
-// en interne - non utilisé ici (openHASP exige juste que la fonction
-// existe quelque part dans le code personnalisé).
+// Point d'accroche appelé PAR le noyau openHASP à CHAQUE publication d'état
+// interne (dispatch_state_subtopic()) - donc pour tous les objets qui ne
+// passent PAS par le mécanisme "action" des simples boutons "btn".
+//
+// CONFIRMÉ par lecture du code source openHASP (hasp_event.cpp / hasp_object.cpp/
+// hasp_dispatch.cpp) : les objets interactifs "btnmatrix", "slider", "roller",
+// "dropdown" et "switch" n'exécutent JAMAIS leur "action" JSON (ce mécanisme,
+// via script_event_handler(), n'est câblé QUE sur generic_event_handler,
+// utilisé par les objets "btn" simples - exactement ce qu'on utilise déjà
+// pour les boutons +/- et le reset WiFi). Ces objets-là publient uniquement
+// leur nouvel état ici, sous forme topic="p<page>b<id>" et
+// payload=JSON {"event":"changed","val":<index>,"text":"<label sélectionné>"}.
+// C'est donc ICI, et pas dans custom_topic_payload(), qu'on récupère les
+// sélecteurs "Auto/Manuel" (vitesse) et "Auto/Fixe/Swing" (volet) de la
+// page 3 (objets "btnmatrix" avec toggle+one_check dans pages.jsonl).
 void custom_state_subtopic(const char* subtopic, const char* payload) {
-    // rien à faire ici pour l'instant
+    if (strcmp(subtopic, "p3b3") == 0) {
+        // Sélecteur vitesse ventilo : options ["Auto","Manuel"] -> val 0 ou 1
+        StaticJsonDocument<128> doc;
+        if (deserializeJson(doc, payload) != DeserializationError::Ok) return;
+        int val = doc["val"] | -1;
+        if (val < 0) return;
+
+        g_vitesse_manuelle_active = (val == 1);
+        prefs.putBool("vit_man_on", g_vitesse_manuelle_active);
+        Serial.printf("[custom] Mode vitesse ventilo -> %s\n", g_vitesse_manuelle_active ? "Manuel" : "Auto");
+        update_dashboard_labels();
+
+    } else if (strcmp(subtopic, "p3b9") == 0) {
+        // Sélecteur position volet : options ["Auto","Fixe","Swing"] -> val 0/1/2
+        StaticJsonDocument<128> doc;
+        if (deserializeJson(doc, payload) != DeserializationError::Ok) return;
+        int val = doc["val"] | -1;
+        if (val < 0 || val > 2) return;
+
+        g_volet_mode = (uint8_t)val;
+        prefs.putUChar("volet_mode", g_volet_mode);
+        Serial.printf("[custom] Position volet -> %u\n", g_volet_mode);
+        update_dashboard_labels();
+    }
 }
 
 // Ajoute nos valeurs au message de capteurs périodique d'openHASP
 void custom_get_sensors(JsonDocument& doc) {
+    float temp_snapshot, hum_snapshot;
+    bool present_snapshot;
+    portENTER_CRITICAL(&g_sht20_mux);
+    temp_snapshot   = g_temperature;
+    hum_snapshot    = g_humidite;
+    present_snapshot = g_sht20_present;
+    portEXIT_CRITICAL(&g_sht20_mux);
+
     JsonObject sensor = doc.createNestedObject(F("sht20"));
-    sensor[F("temperature")] = g_temperature;
-    sensor[F("humidite")]    = g_humidite;
-    sensor[F("present")]     = g_sht20_present;
+    sensor[F("temperature")] = temp_snapshot;
+    sensor[F("humidite")]    = hum_snapshot;
+    sensor[F("present")]     = present_snapshot;
 }
 
-// Reçoit les commandes envoyées vers le topic "custom" - déclenchées soit
-// par MQTT (hasp/<plate>/command/custom), soit localement par un bouton
-// pages.jsonl avec "action":{"up":"custom <commande>"} (mécanisme d'action
-// locale documenté par openHASP, exécuté sans MQTT/broker).
+// Reçoit les commandes routées vers "custom/<sous-topic>" - déclenchées soit
+// par MQTT (hasp/<plate>/command/custom/<sous-topic>), soit localement par un
+// bouton pages.jsonl avec "action":{"up":"custom/<sous-topic>=<valeur>"}.
 //
-// IMPORTANT - à vérifier au premier flash : le routage exact d'une action
-// bouton locale vers ce hook n'est pas garanti à 100% par la documentation
-// publique openHASP (elle documente le mécanisme "action" des boutons et
-// séparément ce hook "custom_topic_payload" pour les messages MQTT, sans
-// confirmer explicitement que les deux passent par le même chemin). Si les
-// boutons +/- ou la réinitialisation WiFi ne réagissent pas au toucher,
-// regarde les logs série au moment du clic : si rien ne s'affiche ici,
-// c'est que l'action locale ne route pas vers custom_topic_payload sur ta
-// version d'openHASP - dis-le moi avec le log et j'ajuste (probablement en
-// passant par dispatch_text_line() direct depuis pages.jsonl, ou un autre
-// hook de ton fork).
+// CONFIRMÉ le [test réel du 24/08] par lecture du code source officiel
+// openHASP (dispatch_topic_payload() dans src/hasp/hasp_dispatch.cpp) : le
+// routeur ne reconnaît PAS le mot "custom" comme commande - il teste si le
+// topic COMMENCE PAR le préfixe littéral "custom/" (avec le slash), retire
+// ces 7 premiers caractères, puis appelle custom_topic_payload() avec le
+// RESTE du topic (déjà débarrassé du préfixe) comme paramètre `topic`. C'est
+// donc bien `topic` qu'il faut tester ici, pas `payload` - et pages.jsonl doit
+// écrire "custom/consigne_plus=1" (pas "custom consigne_plus"). Les logs
+// ESPlogs 10/11 montraient exactement l'erreur inverse : "Command 'custom'
+// not found => consigne_plus", preuve que le bouton atteignait bien le
+// dispatcher mais avec la mauvaise syntaxe de topic.
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
     (void)source;
+    (void)payload;
 
-    if (strcmp(topic, "custom") != 0) return;
+    Serial.printf("[custom] Commande reçue : %s\n", topic);
 
-    Serial.printf("[custom] Commande reçue : %s\n", payload);
-
-    if (strcmp(payload, "consigne_plus") == 0) {
+    if (strcmp(topic, "consigne_plus") == 0) {
         g_consigne += CONSIGNE_STEP;
         if (g_consigne > CONSIGNE_MAX) g_consigne = CONSIGNE_MAX;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
 
-    } else if (strcmp(payload, "consigne_moins") == 0) {
+    } else if (strcmp(topic, "consigne_moins") == 0) {
         g_consigne -= CONSIGNE_STEP;
         if (g_consigne < CONSIGNE_MIN) g_consigne = CONSIGNE_MIN;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
 
-    } else if (strcmp(payload, "wifi_reset_confirm") == 0) {
+    } else if (strcmp(topic, "vitesse_manuelle_plus") == 0) {
+        g_vitesse_manuelle += VITESSE_MANUELLE_STEP;
+        if (g_vitesse_manuelle > VITESSE_MANUELLE_MAX) g_vitesse_manuelle = VITESSE_MANUELLE_MAX;
+        prefs.putFloat("vit_man_val", g_vitesse_manuelle);
+        update_dashboard_labels();
+
+    } else if (strcmp(topic, "vitesse_manuelle_moins") == 0) {
+        g_vitesse_manuelle -= VITESSE_MANUELLE_STEP;
+        if (g_vitesse_manuelle < VITESSE_MANUELLE_MIN) g_vitesse_manuelle = VITESSE_MANUELLE_MIN;
+        prefs.putFloat("vit_man_val", g_vitesse_manuelle);
+        update_dashboard_labels();
+
+    } else if (strcmp(topic, "wifi_reset_confirm") == 0) {
         // Efface les identifiants WiFi stockés (NVS) et redémarre : openHASP
         // se retrouve sans réseau connu et rouvre son portail de config
         // (point d'accès + captive portal) au boot suivant - pas besoin de
