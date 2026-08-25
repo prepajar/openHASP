@@ -105,9 +105,25 @@ static const uint8_t SIM_PROGRAMMES_COUNT = 3;
 // --- Configuration I2C (identique au bus tactile FT6336U déjà initialisé
 // par le driver tactile officiel d'openHASP - on réutilise le même bus,
 // pas de nouveau câblage nécessaire) ---
+//
+// v9 - VITESSE I2C RÉDUITE 400kHz -> 100kHz (ESPlogs 18/19/21) :
+// Après avoir écarté l'alimentation comme cause unique (ESPlogs 18 : SHT20
+// toujours ~21% de réussite même avec une alimentation externe distincte de
+// l'Arduino Uno, alors que les crashs/brownouts eux avaient bien disparu),
+// le message d'échec systématique "le capteur ne répond plus" (absence de
+// réponse/timeout I2C, pas une donnée corrompue-mais-lue comme les CRC
+// invalides vus avant) pointe vers un problème de signal sur le bus plutôt
+// que d'alimentation pure. 400kHz est nettement plus exigeant en qualité de
+// signal (temps de montée, pull-ups) que 100kHz pour un câblage/des
+// composants qui ne sont peut-être pas garantis pour le "Fast Mode" I2C.
+// Test à faible risque : ce Wire.begin() est déjà rappelé une seconde fois
+// ici après l'init du driver tactile FT6336U (même bus physique partagé,
+// cf commentaire ci-dessus) - le rebaisser à 100kHz ralentit donc aussi les
+// transactions tactiles, mais 100kHz reste largement suffisant pour du
+// tactile (bien plus lent que le taux de rafraîchissement de l'écran).
 static const int SHT20_SDA_PIN   = 15;
 static const int SHT20_SCL_PIN   = 6;
-static const uint32_t I2C_FREQ   = 400000;
+static const uint32_t I2C_FREQ   = 100000;
 static const uint8_t  SHT20_ADDR = 0x40;
 
 static const uint8_t SHT20_CMD_TEMP_NOHOLD = 0xF3;
