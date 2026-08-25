@@ -535,9 +535,38 @@ void custom_get_sensors(JsonDocument& doc) {
 // ESPlogs 10/11 montraient exactement l'erreur inverse : "Command 'custom'
 // not found => consigne_plus", preuve que le bouton atteignait bien le
 // dispatcher mais avec la mauvaise syntaxe de topic.
+//
+// v10 - ANTI-REBOND (ESPlogs 22) : l'utilisateur a signalé qu'un seul appui
+// sur "+" fait parfois monter la consigne de 2 crans au lieu d'un. Analyse du
+// log : sur la séquence de "consigne_plus" reçus, deux paires consécutives
+// sont espacées d'EXACTEMENT 264ms (76.551s->76.815s, puis 91.159s->91.423s,
+// à la milliseconde près) alors que tous les autres écarts entre appuis
+// réels vont de ~0.9s à plusieurs secondes. Un écart identique au ms près à
+// deux moments différents ne peut pas être un double-appui humain (jamais
+// aussi régulier) - c'est la signature d'un double événement généré par le
+// driver tactile (rebond) en amont de ce fichier, pas un bug dans la logique
+// consigne_plus/moins elle-même (chaque commande reçue est bien traitée
+// correctement une seule fois). Fix : anti-rebond logiciel, ignore une
+// commande identique à la précédente si elle arrive à moins de 300ms
+// d'écart (marge confortable au-dessus des 264ms observés, très en dessous
+// du plus petit écart entre 2 appuis réels observé, ~0.9s).
+static const uint32_t COMMAND_DEBOUNCE_MS = 300;
+static char     g_last_topic[32] = "";
+static uint32_t g_last_topic_time = 0;
+
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
     (void)source;
     (void)payload;
+
+    uint32_t now = millis();
+    if (strcmp(topic, g_last_topic) == 0 && (now - g_last_topic_time) < COMMAND_DEBOUNCE_MS) {
+        Serial.printf("[custom] Commande '%s' ignorée (rebond, %lums après la précédente)\n",
+                      topic, (unsigned long)(now - g_last_topic_time));
+        return;
+    }
+    strncpy(g_last_topic, topic, sizeof(g_last_topic) - 1);
+    g_last_topic[sizeof(g_last_topic) - 1] = '\0';
+    g_last_topic_time = now;
 
     Serial.printf("[custom] Commande reçue : %s\n", topic);
 
