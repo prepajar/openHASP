@@ -67,7 +67,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v19 (anti-rebond 300ms + filet de securite de rafale 6 pas/1s)";
+    "v20 (anti-rebond 300ms + filet 6 pas/1s + acceleration du pas consigne)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -778,6 +778,46 @@ static bool burst_allow(uint32_t& window_start, uint8_t& count, uint32_t now,
     return true;
 }
 
+// v20 - ACCÉLÉRATION DU PAS SUR RAFALE D'APPUIS (retour ESPlogs 32 : "il
+// faudrait pouvoir taper plus vite"). Analyse du log : le debounce 300ms est
+// déjà à la limite physique du tactile (rebonds groupés 206-290ms, appuis
+// volontaires les plus rapprochés à 309-353ms - quasiment plus de marge pour
+// descendre le seuil sans recommencer à accepter des rebonds). Solution
+// retenue par l'utilisatrice : plutôt que de rogner le debounce, faire
+// grandir le pas au fil d'une série d'appuis rapprochés, pour atteindre la
+// valeur cible avec moins d'appuis, sans toucher à la sécurité anti-rebond.
+// Les 2 premiers appuis d'une série restent à CONSIGNE_STEP (0.5°C), à
+// partir du 3e la série est jugée "rafale volontaire" et le pas passe à
+// CONSIGNE_STEP_ACCEL (1.0°C) - la série se réinitialise si plus de
+// ACCEL_RESET_MS s'écoulent depuis le dernier appui ACCEPTÉ (donc déjà passé
+// le debounce ET le filet de rafale, jamais sur un rebond filtré).
+// Conséquence sur le pire cas de dérive du filet de rafale v19 (6 pas/1s) :
+// passe de 6x0.5=3.0°C à 2x0.5+4x1.0=5.0°C par fenêtre de 1s au pire cas -
+// borné in fine par CONSIGNE_MIN/MAX (5-30°C) quoi qu'il arrive, mais marge
+// de sécurité réduite en échange de la réactivité demandée.
+static const uint32_t ACCEL_RESET_MS         = 1000; // au-delà, la série repart à 1
+static const uint8_t  ACCEL_STREAK_THRESHOLD = 3;     // à partir du 3e appui consécutif rapproché
+static const float    CONSIGNE_STEP_ACCEL    = 1.0f;  // pas élargi une fois la série lancée
+
+static uint32_t g_consigne_streak_time  = 0;
+static uint8_t  g_consigne_streak_count = 0;
+
+// Retourne le pas à appliquer pour CET appui de consigne (déjà accepté par
+// le debounce + le filet de rafale), en tenant compte de la série en cours.
+static float consigne_step_for_streak(uint32_t now) {
+    if ((now - g_consigne_streak_time) > ACCEL_RESET_MS) {
+        g_consigne_streak_count = 0;
+    }
+    g_consigne_streak_count++;
+    g_consigne_streak_time = now;
+    if (g_consigne_streak_count >= ACCEL_STREAK_THRESHOLD) {
+        Serial.printf("[custom] Consigne : pas accéléré (%.1f°C, %u-ème appui de la série)\n",
+                      CONSIGNE_STEP_ACCEL, (unsigned)g_consigne_streak_count);
+        return CONSIGNE_STEP_ACCEL;
+    }
+    return CONSIGNE_STEP;
+}
+
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
     (void)source;
     (void)payload;
@@ -806,7 +846,7 @@ void custom_topic_payload(const char* topic, const char* payload, uint8_t source
                           (unsigned)BURST_MAX_CONSIGNE, (unsigned long)BURST_WINDOW_MS);
             return;
         }
-        g_consigne += CONSIGNE_STEP;
+        g_consigne += consigne_step_for_streak(now);
         if (g_consigne > CONSIGNE_MAX) g_consigne = CONSIGNE_MAX;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
@@ -817,7 +857,7 @@ void custom_topic_payload(const char* topic, const char* payload, uint8_t source
                           (unsigned)BURST_MAX_CONSIGNE, (unsigned long)BURST_WINDOW_MS);
             return;
         }
-        g_consigne -= CONSIGNE_STEP;
+        g_consigne -= consigne_step_for_streak(now);
         if (g_consigne < CONSIGNE_MIN) g_consigne = CONSIGNE_MIN;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
