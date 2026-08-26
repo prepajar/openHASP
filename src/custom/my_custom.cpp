@@ -211,11 +211,26 @@ static bool sht20_read_result(uint16_t& raw_out) {
 }
 
 // Filtre anti-saut : rejette une valeur qui varierait de façon aberrante
-// par rapport à la dernière lecture valide (cycle de 5s -> un vrai
-// changement aussi rapide est physiquement impossible pour de l'air
-// ambiant, donc c'est forcément un résidu de glitch non détecté par le CRC).
-static const float MAX_DELTA_TEMP = 3.0f;  // °C entre 2 lectures consécutives
-static const float MAX_DELTA_HUM  = 10.0f; // %RH entre 2 lectures consécutives
+// par rapport à la dernière lecture valide (cycle de 5s) - sert surtout à
+// filtrer un résidu de glitch non détecté par le CRC (une lecture isolée
+// bizarre au milieu de lectures normales).
+//
+// v14 - GRÂCE APRÈS REJETS CONSÉCUTIFS (ESPlogs 27) : un vrai événement
+// physique rapide (ex. souffle directement sur le capteur, confirmé par
+// l'utilisateur) peut dépasser ce seuil sur PLUSIEURS lectures d'affilée,
+// pas juste une seule. Avant v14, la référence restait figée sur l'ancienne
+// valeur tant qu'aucune lecture ne repassait sous le seuil - jusqu'à 10-15s
+// de blocage observés sur ESPlogs 27 pendant que la vraie valeur redescendait
+// progressivement. Fix : un compteur de rejets consécutifs par grandeur
+// (température/humidité) - après MAX_CONSECUTIVE_REJECTS rejets d'affilée,
+// la lecture est acceptée telle quelle (probable vrai changement plutôt
+// qu'un glitch isolé) et sert de nouvelle référence. Un glitch ponctuel
+// (1 seule lecture aberrante) reste filtré comme avant.
+static const float   MAX_DELTA_TEMP = 3.0f;  // °C entre 2 lectures consécutives
+static const float   MAX_DELTA_HUM  = 10.0f; // %RH entre 2 lectures consécutives
+static const uint8_t MAX_CONSECUTIVE_REJECTS = 2; // rejets tolérés avant d'accepter quand même
+static uint8_t g_temp_reject_count = 0;
+static uint8_t g_hum_reject_count  = 0;
 
 // =====================================================================
 // v13 - LECTURE SHT20 NON BLOQUANTE DANS custom_loop() (remplace la tâche
@@ -304,10 +319,18 @@ static void sht20_state_machine_tick() {
             bool ok = sht20_read_result(raw);
             if (ok) {
                 float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
-                if (!isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP) {
-                    Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", g_temperature, t);
+                bool jump = !isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP;
+                if (jump && g_temp_reject_count < MAX_CONSECUTIVE_REJECTS) {
+                    g_temp_reject_count++;
+                    Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f, rejet %u/%u)\n",
+                                  g_temperature, t, g_temp_reject_count, MAX_CONSECUTIVE_REJECTS);
                     ok = false;
                 } else {
+                    if (jump) {
+                        Serial.printf("[SHT20] Saut de température accepté après %u rejets consécutifs (%.1f -> %.1f) - probable variation réelle\n",
+                                      g_temp_reject_count, g_temperature, t);
+                    }
+                    g_temp_reject_count = 0;
                     g_sht20_pending_t = t;
                 }
             }
@@ -332,9 +355,18 @@ static void sht20_state_machine_tick() {
             float h = NAN;
             if (ok_h) {
                 h = 125.0f * ((float)raw / 65536.0f) - 6.0f;
-                if (!isnan(g_humidite) && fabsf(h - g_humidite) > MAX_DELTA_HUM) {
-                    Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", g_humidite, h);
+                bool jump = !isnan(g_humidite) && fabsf(h - g_humidite) > MAX_DELTA_HUM;
+                if (jump && g_hum_reject_count < MAX_CONSECUTIVE_REJECTS) {
+                    g_hum_reject_count++;
+                    Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f, rejet %u/%u)\n",
+                                  g_humidite, h, g_hum_reject_count, MAX_CONSECUTIVE_REJECTS);
                     ok_h = false;
+                } else if (jump) {
+                    Serial.printf("[SHT20] Saut d'humidité accepté après %u rejets consécutifs (%.1f -> %.1f) - probable variation réelle\n",
+                                  g_hum_reject_count, g_humidite, h);
+                    g_hum_reject_count = 0;
+                } else {
+                    g_hum_reject_count = 0;
                 }
             }
 
@@ -632,6 +664,20 @@ void custom_get_sensors(JsonDocument& doc) {
 // que risquer une dérive incontrôlée). À affiner avec un ESPlogs capturant
 // l'épisode complet (un appui sur "+", laissé dériver) si le phénomène
 // persiste malgré ce seuil.
+//
+// v14 (essai, ABANDONNÉ) - baissé un temps à 700ms suite à un retour
+// utilisateur sur ESPlogs 27, mais réflexion faite : 2000ms protège très
+// bien (aucune dérive sur ESPlogs 27) et le risque d'un pas en trop
+// occasionnel à 700ms (rafales jusqu'à ~1.5s observées sur ce même log)
+// n'était pas justifié tant que la propreté du signal tactile après v13
+// n'est pas confirmée sur plus de tests.
+//
+// v15 - RETOUR À 2000ms, réduction PROGRESSIVE prévue : décision utilisateur
+// de garder la marge de sécurité maximale pour l'instant, et de tester des
+// seuils plus bas (500-700ms, voire moins) par étapes UNE FOIS le tactile
+// confirmé stable sur plusieurs tests consécutifs post-v13 - plutôt que de
+// baisser le seuil en même temps que d'autres changements non encore
+// éprouvés sur la durée.
 static const uint32_t COMMAND_DEBOUNCE_MS = 2000;
 static char     g_last_topic[32] = "";
 static uint32_t g_last_topic_time = 0;
