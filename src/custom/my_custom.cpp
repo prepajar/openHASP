@@ -142,10 +142,10 @@ static const uint8_t SHT20_CMD_HUM_NOHOLD  = 0xF5;
 static const float TEMP_CALIBRATION_OFFSET = 0.0f;
 
 // --- État courant (mis à jour périodiquement) ---
-// Partagé entre la tâche de fond SHT20 (qui écrit) et la boucle principale
-// openHASP (qui lit pour rafraîchir l'écran) - protégé par un spinlock léger
-// (portMUX) plutôt qu'un mutex complet, suffisant pour de simples float/bool.
-static portMUX_TYPE g_sht20_mux = portMUX_INITIALIZER_UNLOCKED;
+// v13 : plus de tâche de fond séparée (voir plus bas) - tout tourne dans le
+// même contexte que le reste d'openHASP (custom_loop()), donc plus besoin de
+// spinlock/mutex pour protéger ces variables : un seul "fil d'exécution" y
+// touche jamais concurremment.
 static float g_temperature   = NAN;
 static float g_humidite      = NAN;
 static bool  g_sht20_present = false;
@@ -176,16 +176,24 @@ static uint8_t sht20_crc8(uint8_t msb, uint8_t lsb) {
     return crc;
 }
 
-// Lance une mesure (commande "no hold") et lit le résultat brut 16 bits
-// après le délai de conversion requis. Retourne true si succès (ACK reçu,
-// 3 octets reçus ET CRC valide).
-static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
+// v13 : sht20_read_raw() (bloquante, avec delay() interne) a été scindée en
+// deux étapes séparées - envoyer la commande, puis (après un délai géré par
+// la machine à états de custom_loop(), SANS bloquer) lire le résultat - pour
+// permettre une lecture SHT20 non bloquante. Voir le commentaire complet
+// au-dessus de custom_loop() plus bas pour le contexte de ce changement.
+
+// Étape 1 : envoie la commande de mesure ("no hold"). Retourne true si le
+// capteur a accusé réception (ACK I2C sur l'adresse + la commande).
+static bool sht20_send_cmd(uint8_t cmd) {
     Wire.beginTransmission(SHT20_ADDR);
     Wire.write(cmd);
-    if (Wire.endTransmission() != 0) return false;
+    return (Wire.endTransmission() == 0);
+}
 
-    delay(delay_ms);
-
+// Étape 2 : à appeler après le délai de conversion requis (85ms température /
+// 29ms humidité) - lit les 3 octets de résultat (MSB, LSB, CRC) et vérifie
+// le CRC. Retourne true si succès (3 octets reçus ET CRC valide).
+static bool sht20_read_result(uint16_t& raw_out) {
     uint8_t received = Wire.requestFrom((int)SHT20_ADDR, 3);
     if (received < 3) return false; // pas assez d'octets reçus (CRC inclus)
 
@@ -209,106 +217,137 @@ static bool sht20_read_raw(uint8_t cmd, uint16_t delay_ms, uint16_t& raw_out) {
 static const float MAX_DELTA_TEMP = 3.0f;  // °C entre 2 lectures consécutives
 static const float MAX_DELTA_HUM  = 10.0f; // %RH entre 2 lectures consécutives
 
-static bool sht20_get_temperature(float& out_c, float last_valid) {
-    uint16_t raw;
-    if (!sht20_read_raw(SHT20_CMD_TEMP_NOHOLD, 85, raw)) return false;
-    float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
-    if (!isnan(last_valid) && fabsf(t - last_valid) > MAX_DELTA_TEMP) {
-        Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", last_valid, t);
-        return false;
-    }
-    out_c = t;
-    return true;
-}
-
-static bool sht20_get_humidity(float& out_rh, float last_valid) {
-    uint16_t raw;
-    if (!sht20_read_raw(SHT20_CMD_HUM_NOHOLD, 29, raw)) return false;
-    float h = 125.0f * ((float)raw / 65536.0f) - 6.0f;
-    if (!isnan(last_valid) && fabsf(h - last_valid) > MAX_DELTA_HUM) {
-        Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", last_valid, h);
-        return false;
-    }
-    out_rh = h;
-    return true;
-}
-
 // =====================================================================
-// Tâche de fond dédiée à la lecture SHT20 (I2C + délais bloquants 85/29ms)
-// - reproduit le pattern du firmware fabricant d'origine (tâche FreeRTOS
-// séparée, cf sht20_freeRTOA_task dans leur code) plutôt que de bloquer la
-// boucle principale d'openHASP qui gère aussi l'écran/le tactile. Ne touche
-// JAMAIS directement l'UI/LVGL depuis cette tâche (pas thread-safe) - se
-// contente d'écrire les valeurs partagées sous spinlock ; c'est
-// custom_every_5seconds(), exécutée dans la boucle principale, qui lit ces
-// valeurs déjà prêtes et les pousse vers l'écran.
+// v13 - LECTURE SHT20 NON BLOQUANTE DANS custom_loop() (remplace la tâche
+// FreeRTOS séparée des versions précédentes)
 //
-// RETOUR TERRAIN (ESPlogs 13) - IMPORTANT, corrige une tentative précédente :
-// la version précédente de ce fichier appelait aussi update_dashboard_labels()
-// depuis custom_loop() (à chaque itération de la boucle principale) pour
-// afficher une nouvelle lecture SHT20 sans attendre le tic 5s suivant.
-// ESPlogs 13 a montré, juste après ce changement, des redémarrages en
-// boucle avec panics "Guru Meditation" (StoreProhibited/LoadProhibited/
-// IllegalInstruction, Core 0 ET Core 1) dès le boot - un symptôme de
-// corruption mémoire. Ce comportement n'existait dans AUCUN log précédent
-// (ESPlogs 10/11/12, tous stables). Je n'ai pas pu identifier la ligne
-// fautive exacte avec certitude (pas de fichier .elf/.map pour décoder les
-// adresses du backtrace, et le driver tactile/LVGL de ce fork n'est pas
-// dans ce fichier) - mais la corrélation temporelle avec CE changement est
-// trop nette pour l'ignorer. Par prudence, l'appel à update_dashboard_labels()
-// depuis custom_loop() a été RETIRÉ (custom_loop() est de nouveau vide) -
-// on revient à l'architecture éprouvée (stable sur ESPlogs 10/11/12) où
-// seule custom_every_5seconds() pousse l'affichage, au prix d'un délai
-// jusqu'à 5s après une lecture réussie. Seul le retry plus rapide en cas
-// d'échec (1s au lieu de 5s, ci-dessous) est conservé - un simple délai,
-// beaucoup plus sûr.
+// HISTORIQUE (pour mémoire) : v4 avait déporté la lecture SHT20 (bloquante,
+// ~114ms/cycle à cause des delay() de conversion) dans sa propre tâche
+// FreeRTOS, pour ne jamais bloquer la boucle principale qui gère aussi
+// l'écran/le tactile. RETOUR TERRAIN (ESPlogs 13) : une tentative ultérieure
+// (v7) d'appeler update_dashboard_labels() depuis custom_loop() en plus de
+// cette tâche a coïncidé avec des redémarrages en boucle (panics "Guru
+// Meditation") - changement annulé (v8), cause exacte jamais formellement
+// identifiée (pas de fichier .elf/.map pour décoder le backtrace).
+//
+// RÉVISION D'ARCHITECTURE (v13, suite à une suggestion externe pertinente
+// de l'utilisateur) : la tâche FreeRTOS séparée pose un problème de fond que
+// je n'avais pas assez pris en compte - elle touche `Wire` (le bus I2C)
+// depuis un CONTEXTE D'EXÉCUTION DIFFÉRENT de celui du driver tactile
+// FT6336U, qui partage EXACTEMENT le même bus physique (SDA=15/SCL=6) mais
+// est piloté depuis la boucle principale d'openHASP. Sans aucune
+// synchronisation entre les deux, un accès concurrent aux mêmes registres
+// matériels I2C peut corrompre l'une ou l'autre transaction - hypothèse
+// cohérente avec à la fois les échecs de lecture SHT20 chroniques ET les
+// événements tactiles parasites observés (rebond du bouton "+", ESPlogs
+// 22/23). Fix : suppression complète de `sht20_task()` et de son
+// xTaskCreate() - la lecture SHT20 est maintenant une machine à états NON
+// BLOQUANTE, avancée à chaque appel de custom_loop() (donc dans le MÊME
+// contexte d'exécution que le reste d'openHASP, plus de contexte concurrent
+// séparé touchant le bus I2C).
+//
+// ATTENTION - pour ne PAS reproduire le crash de v7 : cette machine à états
+// mémorise seulement les valeurs (g_temperature/g_humidite) dans
+// custom_loop() - elle n'appelle JAMAIS dispatch_text_line()/
+// update_dashboard_labels() depuis custom_loop(). L'affichage continue à
+// être poussé UNIQUEMENT par custom_every_5seconds() comme depuis v8, sur
+// son tic habituel - seul l'accès I2C lui-même devient non bloquant/
+// partagé-context-safe, le comportement d'affichage ne change pas.
 // =====================================================================
-static void sht20_task(void* pvParameters) {
-    for (;;) {
-        bool present;
-        portENTER_CRITICAL(&g_sht20_mux);
-        present = g_sht20_present;
-        portEXIT_CRITICAL(&g_sht20_mux);
+enum Sht20State : uint8_t { SHT20_ST_IDLE = 0, SHT20_ST_TEMP_WAIT, SHT20_ST_HUM_WAIT };
+static Sht20State g_sht20_state    = SHT20_ST_IDLE;
+static uint32_t   g_sht20_next_ms  = 0;     // prochain instant où agir (millis())
+static bool       g_sht20_ok_t     = false; // résultat température de ce cycle
+static float      g_sht20_pending_t = NAN;  // température mesurée, en attente de l'humidité
 
-        if (!present) {
-            present = sht20_probe();
-            portENTER_CRITICAL(&g_sht20_mux);
-            g_sht20_present = present;
-            if (!present) { g_temperature = NAN; g_humidite = NAN; }
-            portEXIT_CRITICAL(&g_sht20_mux);
-            if (!present) {
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                continue;
+// Termine un cycle en échec : force un nouveau probe complet au prochain
+// tour, retente vite (1s) plutôt que d'attendre le cycle normal de 5s.
+static void sht20_fail_cycle(bool ok_t, bool ok_h, uint32_t now) {
+    Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
+                  ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
+    g_sht20_present = false;
+    g_sht20_state    = SHT20_ST_IDLE;
+    g_sht20_next_ms  = now + 1000;
+}
+
+// Avance la machine à états SHT20 d'un pas si c'est l'heure. Appelée depuis
+// custom_loop() à chaque itération - ne bloque jamais (pas de delay()).
+static void sht20_state_machine_tick() {
+    uint32_t now = millis();
+    if ((int32_t)(now - g_sht20_next_ms) < 0) return; // pas encore l'heure
+
+    switch (g_sht20_state) {
+        case SHT20_ST_IDLE: {
+            if (!g_sht20_present) {
+                bool present = sht20_probe();
+                g_sht20_present = present;
+                if (!present) {
+                    g_temperature = NAN;
+                    g_humidite    = NAN;
+                    g_sht20_next_ms = now + 5000; // pas de capteur : on retente lentement
+                    return;
+                }
+                Serial.println(F("[SHT20] Capteur détecté (nouvelle tentative)"));
             }
-            Serial.println(F("[SHT20] Capteur détecté (nouvelle tentative)"));
+
+            if (!sht20_send_cmd(SHT20_CMD_TEMP_NOHOLD)) {
+                sht20_fail_cycle(false, false, now);
+                return;
+            }
+            g_sht20_state   = SHT20_ST_TEMP_WAIT;
+            g_sht20_next_ms = now + 85; // délai de conversion température
+            break;
         }
 
-        float last_t, last_h;
-        portENTER_CRITICAL(&g_sht20_mux);
-        last_t = g_temperature;
-        last_h = g_humidite;
-        portEXIT_CRITICAL(&g_sht20_mux);
+        case SHT20_ST_TEMP_WAIT: {
+            uint16_t raw;
+            bool ok = sht20_read_result(raw);
+            if (ok) {
+                float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
+                if (!isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP) {
+                    Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f)\n", g_temperature, t);
+                    ok = false;
+                } else {
+                    g_sht20_pending_t = t;
+                }
+            }
+            g_sht20_ok_t = ok;
 
-        float t, h;
-        bool ok_t = sht20_get_temperature(t, last_t);
-        bool ok_h = sht20_get_humidity(h, last_h);
+            // On tente quand même l'humidité même si la température a échoué
+            // (comportement identique aux versions précédentes - un échec
+            // isolé sur un seul des deux ne veut pas forcément dire que le
+            // capteur ne répond plus du tout).
+            if (!sht20_send_cmd(SHT20_CMD_HUM_NOHOLD)) {
+                sht20_fail_cycle(g_sht20_ok_t, false, now);
+                return;
+            }
+            g_sht20_state   = SHT20_ST_HUM_WAIT;
+            g_sht20_next_ms = now + 29; // délai de conversion humidité
+            break;
+        }
 
-        if (ok_t && ok_h) {
-            portENTER_CRITICAL(&g_sht20_mux);
-            g_temperature = t + TEMP_CALIBRATION_OFFSET;
-            g_humidite    = h;
-            portEXIT_CRITICAL(&g_sht20_mux);
-            Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", t + TEMP_CALIBRATION_OFFSET, h);
+        case SHT20_ST_HUM_WAIT: {
+            uint16_t raw;
+            bool ok_h = sht20_read_result(raw);
+            float h = NAN;
+            if (ok_h) {
+                h = 125.0f * ((float)raw / 65536.0f) - 6.0f;
+                if (!isnan(g_humidite) && fabsf(h - g_humidite) > MAX_DELTA_HUM) {
+                    Serial.printf("[SHT20] Saut d'humidité aberrant ignoré (%.1f -> %.1f)\n", g_humidite, h);
+                    ok_h = false;
+                }
+            }
 
-            vTaskDelay(pdMS_TO_TICKS(5000)); // lecture réussie : cadence normale
-        } else {
-            Serial.printf("[SHT20] Lecture échouée (temp=%s, hum=%s) - le capteur ne répond plus\n",
-                          ok_t ? "OK" : "ECHEC", ok_h ? "OK" : "ECHEC");
-            portENTER_CRITICAL(&g_sht20_mux);
-            g_sht20_present = false; // on retentera un probe complet au prochain cycle
-            portEXIT_CRITICAL(&g_sht20_mux);
-
-            vTaskDelay(pdMS_TO_TICKS(1000)); // échec : on retente vite plutôt que d'attendre 5s
+            if (g_sht20_ok_t && ok_h) {
+                g_temperature = g_sht20_pending_t + TEMP_CALIBRATION_OFFSET;
+                g_humidite    = h;
+                Serial.printf("[SHT20] Température=%.1f°C  Humidité=%.1f%%\n", g_temperature, g_humidite);
+                g_sht20_state   = SHT20_ST_IDLE;
+                g_sht20_next_ms = now + 5000; // lecture réussie : cadence normale
+            } else {
+                sht20_fail_cycle(g_sht20_ok_t, ok_h, now);
+            }
+            break;
         }
     }
 }
@@ -322,13 +361,11 @@ static void sht20_task(void* pvParameters) {
 static void update_dashboard_labels() {
     char buf[48];
 
-    // Snapshot rapide des valeurs partagées avec la tâche de fond SHT20
-    // (juste une copie sous spinlock, aucun accès I2C ici).
-    float temp_snapshot, hum_snapshot;
-    portENTER_CRITICAL(&g_sht20_mux);
-    temp_snapshot = g_temperature;
-    hum_snapshot  = g_humidite;
-    portEXIT_CRITICAL(&g_sht20_mux);
+    // v13 : plus de tâche de fond séparée, donc plus besoin de spinlock -
+    // g_temperature/g_humidite sont mises à jour uniquement depuis
+    // custom_loop() (même contexte que cette fonction), lecture directe OK.
+    float temp_snapshot = g_temperature;
+    float hum_snapshot  = g_humidite;
 
     if (!isnan(temp_snapshot)) {
         snprintf(buf, sizeof(buf), "p1b3.text=%.1f °C", temp_snapshot);
@@ -372,12 +409,12 @@ static void update_dashboard_labels() {
 // =====================================================================
 
 void custom_setup() {
-    // Le bus I2C (SDA=15/SCL=6) est déjà initialisé par le driver tactile
-    // FT6336U d'openHASP avant l'appel à custom_setup(). On rappelle
-    // Wire.begin() avec les mêmes paramètres par sécurité/portabilité -
-    // sans effet de bord attendu puisque ce sont exactement les mêmes
-    // broches/fréquence que celles déjà utilisées pour le tactile.
-    Wire.begin(SHT20_SDA_PIN, SHT20_SCL_PIN, I2C_FREQ);
+    // v13 : le bus I2C (SDA=15/SCL=6) est déjà initialisé par le driver
+    // tactile FT6336U d'openHASP avant l'appel à custom_setup(). On ne
+    // rappelle plus Wire.begin() ici (suggestion reçue et retenue : éviter
+    // de ré-initialiser un bus déjà configuré) ; si besoin de forcer la
+    // fréquence I2C, on utilise setClock() qui n'a pas cet effet de bord.
+    Wire.setClock(I2C_FREQ);
 
     g_sht20_present = sht20_probe();
     if (g_sht20_present) {
@@ -386,10 +423,11 @@ void custom_setup() {
         Serial.println(F("[SHT20] AUCUN capteur détecté à l'adresse 0x40 - vérifier que la puce est bien montée sur ce panneau"));
     }
 
-    // Lecture I2C (bloquante ~114ms/cycle) déportée dans sa propre tâche
-    // FreeRTOS, pour ne jamais bloquer la boucle principale qui gère aussi
-    // l'écran/le tactile (cause probable de la lenteur observée en v3.0).
-    xTaskCreate(sht20_task, "sht20_task", 4096, NULL, 1, NULL);
+    // v13 : plus de tâche FreeRTOS séparée pour la lecture SHT20 - la
+    // lecture I2C est maintenant une machine à états non bloquante avancée
+    // depuis custom_loop() (voir sht20_state_machine_tick() plus haut),
+    // dans le MÊME contexte que le driver tactile, pour éliminer tout accès
+    // concurrent non synchronisé au bus I2C partagé.
 
     // Consigne : rechargée depuis la NVS (survit à un reboot/reflash tant
     // que la partition NVS n'est pas effacée), sinon valeur par défaut 20°C.
@@ -405,12 +443,20 @@ void custom_setup() {
 }
 
 void custom_loop() {
-    // Volontairement vide - cf commentaire au-dessus de sht20_task() : un
-    // essai précédent affichait ici les nouvelles lectures SHT20 sans délai,
-    // mais a coïncidé avec des redémarrages en boucle (ESPlogs 13). Revenu à
-    // une boucle principale qui ne fait rien de plus que ce qui a été
-    // prouvé stable ; l'affichage se fait uniquement dans
-    // custom_every_5seconds().
+    // v13 : fait avancer la machine à états de lecture SHT20 (non bloquante,
+    // basée sur millis()) à chaque itération de la boucle principale
+    // d'openHASP - donc dans le MÊME contexte que le driver tactile, ce qui
+    // élimine l'accès concurrent non synchronisé au bus I2C partagé qui
+    // existait avec l'ancienne tâche FreeRTOS séparée sht20_task().
+    //
+    // RÈGLE CRITIQUE (héritée de la v7, NE JAMAIS ENFREINDRE) : cette
+    // fonction ne doit JAMAIS appeler update_dashboard_labels() ni
+    // dispatch_text_line(). Un essai précédent qui le faisait a coïncidé
+    // avec des redémarrages en boucle (ESPlogs 13). sht20_state_machine_tick()
+    // se contente de mettre à jour des variables internes (g_temperature,
+    // g_humidite, ...) - l'affichage reste exclusivement poussé par
+    // custom_every_5seconds(), comme depuis la v8.
+    sht20_state_machine_tick();
 }
 
 void custom_every_second() {
@@ -419,14 +465,13 @@ void custom_every_second() {
 
 // Exécutée dans la boucle principale d'openHASP (celle qui gère aussi
 // l'écran/le tactile) - ne doit JAMAIS bloquer. Ne fait plus aucun accès
-// I2C : elle se contente de publier l'état déjà lu par sht20_task() et de
-// faire avancer les valeurs simulées.
+// I2C direct : elle se contente de publier l'état déjà lu par la machine à
+// états SHT20 (sht20_state_machine_tick(), avancée dans custom_loop()) et
+// de faire avancer les valeurs simulées.
 void custom_every_5seconds() {
-    float temp_snapshot, hum_snapshot;
-    portENTER_CRITICAL(&g_sht20_mux);
-    temp_snapshot = g_temperature;
-    hum_snapshot  = g_humidite;
-    portEXIT_CRITICAL(&g_sht20_mux);
+    // v13 : plus de spinlock nécessaire, même contexte que custom_loop().
+    float temp_snapshot = g_temperature;
+    float hum_snapshot  = g_humidite;
 
     if (!isnan(temp_snapshot) && !isnan(hum_snapshot)) {
         char pubbuf[16];
@@ -506,13 +551,11 @@ void custom_state_subtopic(const char* subtopic, const char* payload) {
 
 // Ajoute nos valeurs au message de capteurs périodique d'openHASP
 void custom_get_sensors(JsonDocument& doc) {
-    float temp_snapshot, hum_snapshot;
-    bool present_snapshot;
-    portENTER_CRITICAL(&g_sht20_mux);
-    temp_snapshot   = g_temperature;
-    hum_snapshot    = g_humidite;
-    present_snapshot = g_sht20_present;
-    portEXIT_CRITICAL(&g_sht20_mux);
+    // v13 : plus de spinlock nécessaire (lecture faite dans le même
+    // contexte que l'écriture, cf custom_loop()/sht20_state_machine_tick()).
+    float temp_snapshot    = g_temperature;
+    float hum_snapshot     = g_humidite;
+    bool  present_snapshot = g_sht20_present;
 
     JsonObject sensor = doc.createNestedObject(F("sht20"));
     sensor[F("temperature")] = temp_snapshot;
@@ -548,9 +591,48 @@ void custom_get_sensors(JsonDocument& doc) {
 // consigne_plus/moins elle-même (chaque commande reçue est bien traitée
 // correctement une seule fois). Fix : anti-rebond logiciel, ignore une
 // commande identique à la précédente si elle arrive à moins de 300ms
-// d'écart (marge confortable au-dessus des 264ms observés, très en dessous
-// du plus petit écart entre 2 appuis réels observé, ~0.9s).
-static const uint32_t COMMAND_DEBOUNCE_MS = 300;
+// d'écart.
+//
+// v11 - ANTI-REBOND AMÉLIORÉ (ESPlogs 23) : v10 fonctionne bien sur les cas
+// simples (le log confirme plusieurs "ignorée (rebond, 205-272ms...)" -
+// preuve qu'elle attrape bien le rebond immédiat), MAIS l'utilisateur a
+// signalé qu'en tapant 4-5 fois rapidement de suite, la consigne continue à
+// grimper toute seule au-delà de ce qu'il a appuyé (jusqu'à 30°C en fin de
+// test). Cause du trou dans v10 : le chrono n'était réarmé QUE sur une
+// commande acceptée, jamais sur une commande ignorée. Or lors d'une rafale
+// d'appuis rapprochés, un rebond "tardif" (~350-450ms après l'appui accepté,
+// donc hors de la fenêtre de 300ms) se retrouvait comparé à un chrono resté
+// figé sur l'appui accepté précédent, et passait pour un nouvel appui
+// légitime. Fix : fenêtre glissante - le chrono est maintenant réarmé à
+// CHAQUE occurrence de la même commande (acceptée OU ignorée), pas
+// seulement les acceptées. Un rebond tardif qui arrive quand même dans les
+// 400ms du dernier événement (accepté ou non) est donc lui aussi filtré, et
+// toute la rafale de rebonds d'un même appui physique s'écrase en un seul
+// appui compté - alors qu'un vrai appui suivant, séparé de plus de 400ms du
+// dernier événement (rebond compris), redémarre une fenêtre fraîche et est
+// bien accepté. Seuil remonté à 400ms (marge au-dessus des rebonds tardifs
+// observés) - les appuis répétés volontaires les plus rapides observés dans
+// les logs restent nettement au-dessus (~500ms+).
+//
+// v12 - SEUIL RENFORCÉ (retour terrain post-v11) : l'utilisateur précise que
+// le phénomène n'est pas juste "1 ou 2 crans en trop" mais une consigne qui
+// continue à grimper de 0.5 en 0.5 sur plusieurs secondes après UN SEUL
+// appui sur "+" (le même test sur "-" ne reproduit rien). Ça ressemble
+// moins à un simple rebond mécanique qu'à un vrai train d'événements répétés
+// (éventuellement un "appui resté collé" côté driver tactile) qui peut durer
+// plus longtemps que les 400ms de v11. Faute de log capturant précisément
+// cet épisode (durée exacte, écart entre les crans en trop), je ne peux pas
+// encore affiner le seuil avec la même précision qu'en v10/v11 - je monte
+// donc le seuil à 2000ms par prudence (la fenêtre glissante veut dire que
+// tant que les impulsions parasites arrivent à moins de 2s les unes des
+// autres, tout le train s'écrase en 1 seul appui compté, quelle que soit sa
+// durée totale). Contrepartie assumée : un vrai double-appui volontaire très
+// rapide (moins de 2s d'écart) sera aussi ignoré - jugé acceptable pour une
+// consigne de température (mieux vaut réappuyer une deuxième fois après 2s
+// que risquer une dérive incontrôlée). À affiner avec un ESPlogs capturant
+// l'épisode complet (un appui sur "+", laissé dériver) si le phénomène
+// persiste malgré ce seuil.
+static const uint32_t COMMAND_DEBOUNCE_MS = 2000;
 static char     g_last_topic[32] = "";
 static uint32_t g_last_topic_time = 0;
 
@@ -559,14 +641,20 @@ void custom_topic_payload(const char* topic, const char* payload, uint8_t source
     (void)payload;
 
     uint32_t now = millis();
-    if (strcmp(topic, g_last_topic) == 0 && (now - g_last_topic_time) < COMMAND_DEBOUNCE_MS) {
-        Serial.printf("[custom] Commande '%s' ignorée (rebond, %lums après la précédente)\n",
-                      topic, (unsigned long)(now - g_last_topic_time));
-        return;
-    }
+    bool is_bounce = (strcmp(topic, g_last_topic) == 0) && ((now - g_last_topic_time) < COMMAND_DEBOUNCE_MS);
+    uint32_t gap = now - g_last_topic_time; // pour le log, avant de réarmer le chrono
+
+    // Fenêtre glissante : on réarme le chrono à CHAQUE occurrence (acceptée
+    // ou rebond), pas seulement sur acceptation - voir commentaire v11.
     strncpy(g_last_topic, topic, sizeof(g_last_topic) - 1);
     g_last_topic[sizeof(g_last_topic) - 1] = '\0';
     g_last_topic_time = now;
+
+    if (is_bounce) {
+        Serial.printf("[custom] Commande '%s' ignorée (rebond, %lums après la précédente)\n",
+                      topic, (unsigned long)gap);
+        return;
+    }
 
     Serial.printf("[custom] Commande reçue : %s\n", topic);
 
