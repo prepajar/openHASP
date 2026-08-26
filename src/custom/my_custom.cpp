@@ -195,7 +195,13 @@ static bool sht20_send_cmd(uint8_t cmd) {
 // le CRC. Retourne true si succès (3 octets reçus ET CRC valide).
 static bool sht20_read_result(uint16_t& raw_out) {
     uint8_t received = Wire.requestFrom((int)SHT20_ADDR, 3);
-    if (received < 3) return false; // pas assez d'octets reçus (CRC inclus)
+    if (received < 3) {
+        // v16 : vide le buffer I2C des octets partiels éventuellement reçus,
+        // pour ne pas les laisser traîner et fausser la transaction suivante
+        // (idée reprise d'une implémentation alternative soumise par l'utilisateur).
+        while (Wire.available()) (void)Wire.read();
+        return false; // pas assez d'octets reçus (CRC inclus)
+    }
 
     uint8_t msb = Wire.read();
     uint8_t lsb = Wire.read();
@@ -209,6 +215,17 @@ static bool sht20_read_result(uint16_t& raw_out) {
     raw_out = ((uint16_t)msb << 8) | (lsb & 0xFC); // 2 bits de statut à ignorer
     return true;
 }
+
+// v16 - MARGE SUR LES DÉLAIS DE CONVERSION (idée reprise d'une implémentation
+// alternative soumise par l'utilisateur) : le datasheet SHT20 donne 85ms/29ms
+// comme les délais de conversion MAX, sans marge. Depuis v3, on attendait
+// exactement ce minimum (marge zéro) - piste de marge de sécurité identifiée
+// dès le début du projet mais jamais appliquée jusqu'ici. +5-6ms négligeable
+// sur un cycle de 5s, mais réduit le risque de lire une conversion pas tout à
+// fait terminée (source possible d'une partie des échecs "le capteur ne
+// répond plus").
+static const uint32_t SHT20_TEMP_WAIT_MS = 90; // >= 85ms datasheet + marge
+static const uint32_t SHT20_HUM_WAIT_MS  = 35; // >= 29ms datasheet + marge
 
 // Filtre anti-saut : rejette une valeur qui varierait de façon aberrante
 // par rapport à la dernière lecture valide (cycle de 5s) - sert surtout à
@@ -310,7 +327,7 @@ static void sht20_state_machine_tick() {
                 return;
             }
             g_sht20_state   = SHT20_ST_TEMP_WAIT;
-            g_sht20_next_ms = now + 85; // délai de conversion température
+            g_sht20_next_ms = now + SHT20_TEMP_WAIT_MS; // délai de conversion température
             break;
         }
 
@@ -319,16 +336,26 @@ static void sht20_state_machine_tick() {
             bool ok = sht20_read_result(raw);
             if (ok) {
                 float t = 175.72f * ((float)raw / 65536.0f) - 46.85f;
-                bool jump = !isnan(g_temperature) && fabsf(t - g_temperature) > MAX_DELTA_TEMP;
+                // v16 : g_temperature stocke la valeur CALIBRÉE (t + offset au
+                // moment du commit, voir plus bas), alors que `t` ici est la
+                // lecture BRUTE de ce cycle - il faut donc retirer l'offset de
+                // la référence avant de comparer, sinon un TEMP_CALIBRATION_OFFSET
+                // non nul créerait un écart artificiel à chaque cycle et
+                // fausserait le filtre anti-saut (idée reprise d'une
+                // implémentation alternative soumise par l'utilisateur ;
+                // sans effet tant que l'offset reste à 0.0f, mais nécessaire
+                // dès que la calibration sera faite).
+                float last_t_raw = isnan(g_temperature) ? NAN : (g_temperature - TEMP_CALIBRATION_OFFSET);
+                bool jump = !isnan(last_t_raw) && fabsf(t - last_t_raw) > MAX_DELTA_TEMP;
                 if (jump && g_temp_reject_count < MAX_CONSECUTIVE_REJECTS) {
                     g_temp_reject_count++;
                     Serial.printf("[SHT20] Saut de température aberrant ignoré (%.1f -> %.1f, rejet %u/%u)\n",
-                                  g_temperature, t, g_temp_reject_count, MAX_CONSECUTIVE_REJECTS);
+                                  last_t_raw, t, g_temp_reject_count, MAX_CONSECUTIVE_REJECTS);
                     ok = false;
                 } else {
                     if (jump) {
                         Serial.printf("[SHT20] Saut de température accepté après %u rejets consécutifs (%.1f -> %.1f) - probable variation réelle\n",
-                                      g_temp_reject_count, g_temperature, t);
+                                      g_temp_reject_count, last_t_raw, t);
                     }
                     g_temp_reject_count = 0;
                     g_sht20_pending_t = t;
@@ -345,7 +372,7 @@ static void sht20_state_machine_tick() {
                 return;
             }
             g_sht20_state   = SHT20_ST_HUM_WAIT;
-            g_sht20_next_ms = now + 29; // délai de conversion humidité
+            g_sht20_next_ms = now + SHT20_HUM_WAIT_MS; // délai de conversion humidité
             break;
         }
 
