@@ -705,9 +705,53 @@ void custom_get_sensors(JsonDocument& doc) {
 // confirmé stable sur plusieurs tests consécutifs post-v13 - plutôt que de
 // baisser le seuil en même temps que d'autres changements non encore
 // éprouvés sur la durée.
-static const uint32_t COMMAND_DEBOUNCE_MS = 2000;
+//
+// v17 - RESPONSIVITÉ + FILET DE SÉCURITÉ SÉPARÉ (retour terrain : 2000ms jugé
+// "pénible" pour des appuis rapprochés volontaires). ESPlogs 27/28/29 ont
+// confirmé sur 3 tests consécutifs que le tactile reste stable (pas de
+// dérive) mais peut encore produire des rafales de rebonds approchant 2s
+// (1978ms, 1952ms observés) - baisser directement le seuil de debounce
+// aurait donc réintroduit un vrai risque de rebonds non filtrés. Solution :
+// séparer les deux rôles qu'assumait `COMMAND_DEBOUNCE_MS` à lui seul.
+//   1) Anti-rebond immédiat, redescendu à 300ms (valeur d'origine v10,
+//      couvre tous les rebonds serrés observés en pratique : 144-272ms) -
+//      redonne une réponse quasi instantanée à un appui volontaire.
+//   2) Filet de sécurité INDÉPENDANT : `burst_allow()` limite le nombre de
+//      commandes ACCEPTÉES (donc déjà passées le filtre ci-dessus) sur une
+//      fenêtre de temps, par famille de boutons (consigne +/- partagent un
+//      compteur, vitesse manuelle +/- un autre). Même si des rebonds plus
+//      espacés que 300ms passent le premier filtre, ce filet plafonne le
+//      changement total possible en rafale (1.5°C / 3 pas pour la consigne,
+//      sur 3s) - donc même dans le pire cas, plus de dérive incontrôlée
+//      jusqu'à 30°C façon ESPlogs 23, juste un léger dépassement borné et
+//      facilement corrigible.
+static const uint32_t COMMAND_DEBOUNCE_MS = 300;
 static char     g_last_topic[32] = "";
 static uint32_t g_last_topic_time = 0;
+
+static const uint32_t BURST_WINDOW_MS        = 3000; // fenêtre du filet de sécurité
+static const uint8_t  BURST_MAX_CONSIGNE     = 3;     // 3 pas de 0.5°C = 1.5°C max / fenêtre
+static const uint8_t  BURST_MAX_VITESSE      = 4;     // 4 pas de 5% = 20% max / fenêtre
+
+static uint32_t g_consigne_burst_start = 0;
+static uint8_t  g_consigne_burst_count = 0;
+static uint32_t g_vitesse_burst_start  = 0;
+static uint8_t  g_vitesse_burst_count  = 0;
+
+// Filet de sécurité indépendant du debounce : autorise au plus `max_count`
+// commandes déjà acceptées par famille sur une fenêtre de `window_ms`. La
+// fenêtre redémarre dès qu'elle est dépassée depuis son dernier départ (pas
+// une fenêtre glissante par événement - plus simple, suffisant ici).
+static bool burst_allow(uint32_t& window_start, uint8_t& count, uint32_t now,
+                         uint32_t window_ms, uint8_t max_count) {
+    if ((now - window_start) > window_ms) {
+        window_start = now;
+        count = 0;
+    }
+    if (count >= max_count) return false;
+    count++;
+    return true;
+}
 
 void custom_topic_payload(const char* topic, const char* payload, uint8_t source) {
     (void)source;
@@ -732,24 +776,44 @@ void custom_topic_payload(const char* topic, const char* payload, uint8_t source
     Serial.printf("[custom] Commande reçue : %s\n", topic);
 
     if (strcmp(topic, "consigne_plus") == 0) {
+        if (!burst_allow(g_consigne_burst_start, g_consigne_burst_count, now, BURST_WINDOW_MS, BURST_MAX_CONSIGNE)) {
+            Serial.printf("[custom] Consigne : limite de sécurité de rafale atteinte (%u pas / %lums) - réessayer dans un instant\n",
+                          (unsigned)BURST_MAX_CONSIGNE, (unsigned long)BURST_WINDOW_MS);
+            return;
+        }
         g_consigne += CONSIGNE_STEP;
         if (g_consigne > CONSIGNE_MAX) g_consigne = CONSIGNE_MAX;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
 
     } else if (strcmp(topic, "consigne_moins") == 0) {
+        if (!burst_allow(g_consigne_burst_start, g_consigne_burst_count, now, BURST_WINDOW_MS, BURST_MAX_CONSIGNE)) {
+            Serial.printf("[custom] Consigne : limite de sécurité de rafale atteinte (%u pas / %lums) - réessayer dans un instant\n",
+                          (unsigned)BURST_MAX_CONSIGNE, (unsigned long)BURST_WINDOW_MS);
+            return;
+        }
         g_consigne -= CONSIGNE_STEP;
         if (g_consigne < CONSIGNE_MIN) g_consigne = CONSIGNE_MIN;
         prefs.putFloat("consigne", g_consigne);
         update_dashboard_labels();
 
     } else if (strcmp(topic, "vitesse_manuelle_plus") == 0) {
+        if (!burst_allow(g_vitesse_burst_start, g_vitesse_burst_count, now, BURST_WINDOW_MS, BURST_MAX_VITESSE)) {
+            Serial.printf("[custom] Vitesse manuelle : limite de sécurité de rafale atteinte (%u pas / %lums) - réessayer dans un instant\n",
+                          (unsigned)BURST_MAX_VITESSE, (unsigned long)BURST_WINDOW_MS);
+            return;
+        }
         g_vitesse_manuelle += VITESSE_MANUELLE_STEP;
         if (g_vitesse_manuelle > VITESSE_MANUELLE_MAX) g_vitesse_manuelle = VITESSE_MANUELLE_MAX;
         prefs.putFloat("vit_man_val", g_vitesse_manuelle);
         update_dashboard_labels();
 
     } else if (strcmp(topic, "vitesse_manuelle_moins") == 0) {
+        if (!burst_allow(g_vitesse_burst_start, g_vitesse_burst_count, now, BURST_WINDOW_MS, BURST_MAX_VITESSE)) {
+            Serial.printf("[custom] Vitesse manuelle : limite de sécurité de rafale atteinte (%u pas / %lums) - réessayer dans un instant\n",
+                          (unsigned)BURST_MAX_VITESSE, (unsigned long)BURST_WINDOW_MS);
+            return;
+        }
         g_vitesse_manuelle -= VITESSE_MANUELLE_STEP;
         if (g_vitesse_manuelle < VITESSE_MANUELLE_MIN) g_vitesse_manuelle = VITESSE_MANUELLE_MIN;
         prefs.putFloat("vit_man_val", g_vitesse_manuelle);
