@@ -67,7 +67,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v18 (anti-rebond 300ms + filet de securite de rafale 3s, repere de version)";
+    "v19 (anti-rebond 300ms + filet de securite de rafale 6 pas/1s)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -746,8 +746,16 @@ static const uint32_t COMMAND_DEBOUNCE_MS = 300;
 static char     g_last_topic[32] = "";
 static uint32_t g_last_topic_time = 0;
 
-static const uint32_t BURST_WINDOW_MS        = 3000; // fenêtre du filet de sécurité
-static const uint8_t  BURST_MAX_CONSIGNE     = 3;     // 3 pas de 0.5°C = 1.5°C max / fenêtre
+// v19 - réglages assouplis à la demande de l'utilisatrice suite à ESPlogs 31
+// (plafond à 3 pas/3s jugé trop restrictif à l'usage réel des boutons +/-).
+// Nouveau réglage : 6 pas / 1s. Pour la consigne, ça monte le pire cas de
+// 1.5°C/3s (0.5°C/s) à 3.0°C/1s (3°C/s) - la vitesse de dérive max en cas de
+// rafale de rebonds non filtrée est donc plus élevée qu'avant, mais reste
+// bornée dans tous les cas par CONSIGNE_MIN/MAX (5-30°C) - impossible de
+// sortir de cette plage quoi qu'il arrive. Fenêtre partagée avec la vitesse
+// manuelle (même mécanisme) : 20%/3s devient 20%/1s pour elle aussi.
+static const uint32_t BURST_WINDOW_MS        = 1000; // fenêtre du filet de sécurité
+static const uint8_t  BURST_MAX_CONSIGNE     = 6;     // 6 pas de 0.5°C = 3.0°C max / fenêtre
 static const uint8_t  BURST_MAX_VITESSE      = 4;     // 4 pas de 5% = 20% max / fenêtre
 
 static uint32_t g_consigne_burst_start = 0;
