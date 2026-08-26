@@ -57,6 +57,18 @@
 #include <math.h>
 
 // =====================================================================
+// v18 - REPÈRE DE VERSION AU BOOT
+// Ajouté suite à une ambiguïté réelle (ESPlogs 30) : le comportement observé
+// (rebonds jusqu'à 1892ms encore filtrés) correspondait au seuil ~2000ms
+// (v12/v15) alors que l'utilisatrice pensait avoir flashé la v17 (300ms +
+// filet de rafale). Sans repère explicite dans les logs, impossible de
+// trancher avec certitude entre "mauvaise version flashée" et "bug v17".
+// Cette ligne, imprimée en tout premier dans custom_setup(), élimine ce
+// doute pour tous les tests futurs : le firmware réellement actif s'annonce
+// lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
+static const char* FIRMWARE_VERSION =
+    "v18 (anti-rebond 300ms + filet de securite de rafale 3s, repere de version)";
+
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
 // restent RÉELLES (capteur SHT20 déjà confirmé fonctionnel ci-dessous) ;
@@ -468,6 +480,11 @@ static void update_dashboard_labels() {
 // =====================================================================
 
 void custom_setup() {
+    // v18 : repère de version imprimé en tout premier, avant toute autre
+    // initialisation - permet de confirmer sans ambiguïté depuis un simple
+    // log série quel firmware tourne réellement sur le panneau.
+    Serial.printf("[custom] my_custom.cpp - version : %s\n", FIRMWARE_VERSION);
+
     // v13 : le bus I2C (SDA=15/SCL=6) est déjà initialisé par le driver
     // tactile FT6336U d'openHASP avant l'appel à custom_setup(). On ne
     // rappelle plus Wire.begin() ici (suggestion reçue et retenue : éviter
