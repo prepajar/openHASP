@@ -67,7 +67,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v20 (anti-rebond 300ms + filet 6 pas/1s + acceleration du pas consigne)";
+    "v21 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -742,7 +742,19 @@ void custom_get_sensors(JsonDocument& doc) {
 //      sur 3s) - donc même dans le pire cas, plus de dérive incontrôlée
 //      jusqu'à 30°C façon ESPlogs 23, juste un léger dépassement borné et
 //      facilement corrigible.
-static const uint32_t COMMAND_DEBOUNCE_MS = 300;
+//
+// v21 - DEBOUNCE DESCENDU À 150ms, décision utilisateur EXPLICITE malgré un
+// risque signalé et confirmé en connaissance de cause : sur ESPlogs 31/32/33
+// (seuil 300ms), les rebonds observés (double-événement du driver tactile
+// sur UN SEUL appui) tombent quasi tous entre 205 et 290ms - un seul cas à
+// 125ms sur tout l'historique. À 150ms, la quasi-totalité de ces rebonds
+// (205-290ms) NE sont plus filtrés et seront acceptés comme des appuis
+// distincts - risque réel de recompter un seul appui plusieurs fois, comme
+// avant le fix v10 (ESPlogs 22/23, dérive jusqu'à 30°C). Le filet de rafale
+// (v19/v20, 6 pas/1s) et l'accélération du pas (v20) restent actifs et
+// bornent quand même le pire cas final à CONSIGNE_MIN/MAX (5-30°C), mais la
+// marge de protection contre un simple double-comptage est très réduite.
+static const uint32_t COMMAND_DEBOUNCE_MS = 150;
 static char     g_last_topic[32] = "";
 static uint32_t g_last_topic_time = 0;
 
