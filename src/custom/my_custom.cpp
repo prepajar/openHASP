@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v22 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI)";
+    "v23 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI + diagnostic bus-off)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -456,6 +456,25 @@ static const uint32_t   CAN_HEARTBEAT_ID     = 0x100; // trame envoyée par le P
 static const uint32_t   CAN_LISTEN_ID        = 0x200; // trame envoyée par l'ESP32 secondaire
 static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
 
+// v23 - DIAGNOSTIC ÉTENDU + RÉCUPÉRATION AUTO BUS-OFF (ESPlogs 41) : le
+// premier test réel a montré ~6 envois réussis (mise en file d'attente OK)
+// puis des échecs "UNKNOWN ERROR" qui ne se sont plus jamais rétablis dans
+// la fenêtre du log. `twai_transmit()` avec timeout=0 ne dit QUE si la trame
+// a pu être mise en file (pas si elle a été acquittée sur le bus) - un
+// "succès" ne prouve donc pas à lui seul un lien bidirectionnel réel ; seule
+// la réception d'une trame de l'autre côté (log "Trame recue...") le prouve.
+// Ajout : (1) le code d'erreur BRUT (en plus du nom, potentiellement
+// "UNKNOWN ERROR" si non reconnu par esp_err_to_name()) pour pouvoir
+// identifier précisément la cause ; (2) un dump périodique (5s) de
+// twai_get_status_info() - état du contrôleur (RUNNING/BUS_OFF/RECOVERING/
+// STOPPED) + compteurs d'erreurs TX/RX - pour distinguer "personne n'accuse
+// réception" (file d'attente pleine, comportement normal sans partenaire) de
+// "vraie erreur de bus" (BUS_OFF, généralement câblage/terminaison/débit) ;
+// (3) récupération automatique si BUS_OFF est détecté (sinon le contrôleur
+// resterait bloqué indéfiniment sans intervention manuelle).
+static const uint32_t CAN_STATUS_INTERVAL_MS = 5000;
+static uint32_t g_can_next_status_ms = 0;
+
 static bool     g_can_ready        = false;
 static uint32_t g_can_next_send_ms = 0;
 
@@ -496,9 +515,11 @@ static void can_tick() {
 
         esp_err_t err = twai_transmit(&msg, 0); // timeout=0 -> jamais bloquant
         if (err == ESP_OK) {
-            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100)"));
+            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100) [mise en file OK - ne prouve pas a lui seul un acquittement reel]"));
         } else {
-            Serial.printf("[CAN] Echec envoi (id 0x100) : %s\n", esp_err_to_name(err));
+            // v23 : code brut en plus du nom - esp_err_to_name() peut renvoyer
+            // "UNKNOWN ERROR" pour un code non enregistre dans sa table.
+            Serial.printf("[CAN] Echec envoi (id 0x100) : %s (code brut %d)\n", esp_err_to_name(err), (int)err);
         }
         g_can_next_send_ms = now + CAN_SEND_INTERVAL_MS;
     }
@@ -514,6 +535,40 @@ static void can_tick() {
             }
             Serial.println();
         }
+    }
+
+    // --- v23 : dump périodique de l'état du contrôleur TWAI (toutes les 5s) ---
+    if ((int32_t)(now - g_can_next_status_ms) >= 0) {
+        twai_status_info_t status;
+        if (twai_get_status_info(&status) == ESP_OK) {
+            const char* state_str;
+            switch (status.state) {
+                case TWAI_STATE_STOPPED:    state_str = "STOPPED";    break;
+                case TWAI_STATE_RUNNING:    state_str = "RUNNING";    break;
+                case TWAI_STATE_BUS_OFF:    state_str = "BUS_OFF";    break;
+                case TWAI_STATE_RECOVERING: state_str = "RECOVERING"; break;
+                default:                    state_str = "?";          break;
+            }
+            Serial.printf("[CAN] Etat bus : %s, TEC=%u, REC=%u, en_attente_tx=%u, en_attente_rx=%u, erreurs_bus=%u, ratees_rx=%u\n",
+                          state_str, (unsigned)status.tx_error_counter, (unsigned)status.rx_error_counter,
+                          (unsigned)status.msgs_to_tx, (unsigned)status.msgs_to_rx,
+                          (unsigned)status.bus_error_count, (unsigned)status.rx_missed_count);
+
+            if (status.state == TWAI_STATE_BUS_OFF) {
+                // Trop d'erreurs de bus accumulees (typiquement cablage/
+                // terminaison/debit incorrect) - sans ca le controleur
+                // resterait bloque indefiniment tant que rien ne relance
+                // manuellement la recuperation.
+                Serial.println(F("[CAN] BUS_OFF detecte - lancement de la recuperation..."));
+                twai_initiate_recovery();
+            } else if (status.state == TWAI_STATE_STOPPED) {
+                // Arrive apres une recuperation BUS_OFF reussie (ou tout
+                // autre arret inattendu) - relance le controleur.
+                Serial.println(F("[CAN] Controleur a l'arret - redemarrage..."));
+                twai_start();
+            }
+        }
+        g_can_next_status_ms = now + CAN_STATUS_INTERVAL_MS;
     }
 }
 
