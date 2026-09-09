@@ -14,7 +14,8 @@
 // plusieurs hypothèses de GPIO testées. Le projet est passé à un pilotage
 // DIY des actionneurs (moteur ventilateur + moteur pas à pas) par un ESP
 // secondaire, indépendant du panneau. Tout le code Modbus a été retiré
-// d'ici - ce fichier ne gère plus que l'affichage local temp/humidité.
+// d'ici - ce fichier ne gère plus que l'affichage local temp/humidité,
+// et depuis v22, le lien CAN (TWAI) vers cet ESP32 secondaire.
 //
 // SOURCE DE CETTE IMPLÉMENTATION :
 // Le fabricant du panneau fournit un firmware de démo distinct (ESP-IDF +
@@ -55,6 +56,7 @@
 #include <ArduinoJson.h>
 #include <string.h>
 #include <math.h>
+#include "driver/twai.h"
 
 // =====================================================================
 // v18 - REPÈRE DE VERSION AU BOOT
@@ -67,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v21 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne)";
+    "v22 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -424,6 +426,98 @@ static void sht20_state_machine_tick() {
 }
 
 // =====================================================================
+// v22 - Test du lien CAN (TWAI) avec l'ESP32 secondaire
+//
+// Objectif : valider UNIQUEMENT le lien CAN avant de lui faire porter la
+// moindre vraie commande - même méthode incrémentale que pour le SHT20 et
+// que le test déjà validé côté ESP32 secondaire (esp32_secondaire_can_test.yaml).
+// Envoie un battement de coeur toutes les 2s (id 0x100), écoute/journalise
+// les battements de coeur reçus de l'ESP32 secondaire (id 0x200). Dès que
+// les DEUX côtés loguent des réceptions, le lien est validé et on pourra
+// remplacer ces battements de coeur par les vraies trames de commande/état.
+//
+// Utilise le driver TWAI natif d'ESP-IDF (driver/twai.h, inclus dans le
+// core arduino-esp32, aucune librairie externe à ajouter au build GitHub
+// Actions). Broches : connecteur 20 broches, EXT_IO3/EXT_IO4 -
+// CAN_TX (CTX) = GPIO19, CAN_RX (CRX) = GPIO7 (cf mémoire du projet -
+// plan de câblage validé).
+//
+// NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
+// twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
+// donc ils retournent immédiatement (succès, mailbox pleine, ou rien à
+// lire) sans jamais mettre custom_loop() en pause. can_tick() ne fait que
+// des Serial.print() - jamais de dispatch_text_line()/
+// update_dashboard_labels() depuis ici, même règle de sécurité que pour le
+// SHT20 (cf RÈGLE CRITIQUE au-dessus de custom_loop() plus bas).
+// =====================================================================
+static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_19;
+static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_7;
+static const uint32_t   CAN_HEARTBEAT_ID     = 0x100; // trame envoyée par le Panlee
+static const uint32_t   CAN_LISTEN_ID        = 0x200; // trame envoyée par l'ESP32 secondaire
+static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
+
+static bool     g_can_ready        = false;
+static uint32_t g_can_next_send_ms = 0;
+
+// Installe et démarre le driver TWAI. Appelée une seule fois depuis
+// custom_setup(). Si l'installation échoue (broche déjà utilisée ailleurs,
+// etc.), g_can_ready reste false et can_tick() ne fait plus rien - pas de
+// blocage/crash, juste pas de CAN, comme le "capteur absent" du SHT20.
+static void can_setup() {
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_125KBITS();
+    twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO19/GPIO7"));
+        return;
+    }
+    if (twai_start() != ESP_OK) {
+        Serial.println(F("[CAN] Echec twai_start()"));
+        return;
+    }
+    g_can_ready = true;
+    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO19, RX=GPIO7)"));
+}
+
+// Non bloquante, appelée depuis custom_loop() à chaque itération.
+static void can_tick() {
+    if (!g_can_ready) return;
+    uint32_t now = millis();
+
+    // --- Envoi du battement de coeur toutes les 2s ---
+    if ((int32_t)(now - g_can_next_send_ms) >= 0) {
+        twai_message_t msg = {};
+        msg.identifier = CAN_HEARTBEAT_ID;
+        msg.data_length_code = 2;
+        msg.data[0] = 0xAA;
+        msg.data[1] = 0x55;
+
+        esp_err_t err = twai_transmit(&msg, 0); // timeout=0 -> jamais bloquant
+        if (err == ESP_OK) {
+            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100)"));
+        } else {
+            Serial.printf("[CAN] Echec envoi (id 0x100) : %s\n", esp_err_to_name(err));
+        }
+        g_can_next_send_ms = now + CAN_SEND_INTERVAL_MS;
+    }
+
+    // --- Réception : draine toutes les trames en attente (timeout=0) ---
+    twai_message_t rx_msg;
+    while (twai_receive(&rx_msg, 0) == ESP_OK) {
+        if (rx_msg.identifier == CAN_LISTEN_ID) {
+            Serial.printf("[CAN] Trame recue de l'ESP32 secondaire - id: 0x%03X, %d octet(s) :",
+                          (unsigned)rx_msg.identifier, rx_msg.data_length_code);
+            for (int i = 0; i < rx_msg.data_length_code; i++) {
+                Serial.printf(" %02X", rx_msg.data[i]);
+            }
+            Serial.println();
+        }
+    }
+}
+
+// =====================================================================
 // Mise à jour des labels du dashboard (pages.jsonl)
 // Utilise dispatch_text_line(), le point d'entrée officiel openHASP pour
 // injecter une commande "pXbY.attribut=valeur" depuis du code custom -
@@ -505,6 +599,10 @@ void custom_setup() {
     // dans le MÊME contexte que le driver tactile, pour éliminer tout accès
     // concurrent non synchronisé au bus I2C partagé.
 
+    // v22 : démarrage du bus CAN (TWAI) vers l'ESP32 secondaire - voir
+    // can_setup() plus haut pour le détail.
+    can_setup();
+
     // Consigne : rechargée depuis la NVS (survit à un reboot/reflash tant
     // que la partition NVS n'est pas effacée), sinon valeur par défaut 20°C.
     prefs.begin("daikin", false);
@@ -531,8 +629,11 @@ void custom_loop() {
     // avec des redémarrages en boucle (ESPlogs 13). sht20_state_machine_tick()
     // se contente de mettre à jour des variables internes (g_temperature,
     // g_humidite, ...) - l'affichage reste exclusivement poussé par
-    // custom_every_5seconds(), comme depuis la v8.
+    // custom_every_5seconds(), comme depuis la v8. can_tick() (v22) suit
+    // exactement la même règle : Serial.print() uniquement, jamais de
+    // dispatch depuis custom_loop().
     sht20_state_machine_tick();
+    can_tick();
 }
 
 void custom_every_second() {
@@ -580,6 +681,11 @@ bool custom_pin_in_use(uint8_t pin) {
     // GPIO15/GPIO6 sont déjà déclarées utilisées par le driver tactile
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
+    //
+    // v22 : GPIO19/GPIO7 (CAN_TX/CAN_RX, TWAI) réservées explicitement ici
+    // pour éviter qu'une configuration GPIO openHASP (hasp config) ne
+    // vienne les réutiliser par erreur pour autre chose.
+    if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
     return false;
 }
 
