@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v25 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO2/GPIO1 - diagnostic conflit USB natif GPIO19)";
+    "v26 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO9/GPIO20 - 3e broche testee)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -441,26 +441,27 @@ static void sht20_state_machine_tick() {
 // Actions). Broches d'origine (v22-v24) : connecteur 20 broches,
 // EXT_IO3/EXT_IO4 - CAN_TX (CTX) = GPIO19, CAN_RX (CRX) = GPIO7.
 //
-// v25 - TEST DIAGNOSTIC TEMPORAIRE : à l'oscilloscope, AUCUNE activité
+// v25 - TEST DIAGNOSTIC TEMPORAIRE #1 : à l'oscilloscope, AUCUNE activité
 // électrique constatée sur GPIO19 ET GPIO7 malgré des envois "réussis" côté
-// logiciel (mise en file d'attente OK, cf commentaire v23 plus bas) - le
-// matériel TWAI ne semble jamais réellement piloter ces broches. Sur
-// l'ESP32-S3 (chip du Panlee), GPIO19/GPIO20 sont les broches USB natif
-// fixées au niveau du silicium (D-/D+) - si l'option "USB CDC on Boot" (ou
-// équivalent) est active dans la configuration de build, le firmware
-// s'accapare GPIO19 en interne au démarrage même sans port USB natif
-// câblé, ce qui empêcherait le driver TWAI de piloter réellement la broche
-// malgré un retour ESP_OK à l'installation. Pour trancher sans ambiguïté,
-// bascule temporaire de test sur GPIO2/GPIO1 (pins 17-18 du connecteur,
-// TXD_EXT/RXD_EXT) - aucun rapport avec l'USB natif. ATTENTION : ces 2
-// broches sont câblées en interne à la puce RS485 SP3485 du Panlee (comm
-// EKRTCTRL2 abandonnée) - risque de charge/bruit sur le signal CAN, donc
-// affectation VOLONTAIREMENT TEMPORAIRE pour ce test, pas retenue comme
-// solution finale même si elle s'avère fonctionner (cf mémoire du projet).
-// Si l'activité apparaît ici à l'oscillo alors qu'elle était absente sur
-// GPIO19/GPIO7, ça confirme le conflit USB natif ; si toujours rien, le
-// problème est plus large (driver/compilation) et pas lié à un conflit de
-// broche particulier.
+// logiciel (mise en file d'attente OK, cf commentaire v23 plus bas). Bascule
+// de test sur GPIO2/GPIO1 (pins 17-18, TXD_EXT/RXD_EXT) - PAS retenue comme
+// solution finale (câblées en interne à la puce RS485 SP3485 du Panlee,
+// risque de charge/bruit confirmé).
+//
+// v26 - TEST DIAGNOSTIC TEMPORAIRE #2 (ESPlogs 51) : sur GPIO2/GPIO1, le
+// bus est entré en erreur de bus RÉELLE dès le tout premier battement de
+// coeur ("ALERTE : erreur de bus (bit/stuff/crc/form)" - erreur matérielle
+// directe, pas juste une absence d'ACK) suivie d'un BUS_OFF quasi
+// instantané, cycle qui se répète à chaque redémarrage. Ce type d'erreur ne
+// peut survenir que si le contrôleur pilote réellement la broche physique -
+// cohérent avec l'hypothèse d'interférence de la puce RS485 sur GPIO2/GPIO1
+// plutôt qu'un silence total comme sur GPIO19/GPIO7. Pour isoler
+// définitivement le problème sur une broche sans AUCUN conflit connu
+// (ni USB natif, ni RS485), bascule de test sur GPIO9/GPIO20 (pins 6-5 du
+// connecteur, EXT_IO1/EXT_IO2) - les 2 seules broches du connecteur encore
+// jamais essayées pour le CAN et documentées comme libres de tout usage
+// interne (cf mémoire du projet). Câblage requis : GPIO9 -> CTX du
+// transceiver, GPIO20 -> CRX du transceiver (à la place de GPIO2/GPIO1).
 //
 // NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
 // twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
@@ -470,8 +471,8 @@ static void sht20_state_machine_tick() {
 // update_dashboard_labels() depuis ici, même règle de sécurité que pour le
 // SHT20 (cf RÈGLE CRITIQUE au-dessus de custom_loop() plus bas).
 // =====================================================================
-static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_2;  // v25 test - etait GPIO_NUM_19
-static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_1;  // v25 test - etait GPIO_NUM_7
+static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_9;   // v26 test - etait GPIO_NUM_2 (v25), GPIO_NUM_19 (v22-24)
+static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_20;  // v26 test - etait GPIO_NUM_1 (v25), GPIO_NUM_7 (v22-24)
 static const uint32_t   CAN_HEARTBEAT_ID     = 0x100; // trame envoyée par le Panlee
 static const uint32_t   CAN_LISTEN_ID        = 0x200; // trame envoyée par l'ESP32 secondaire
 static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
@@ -524,7 +525,7 @@ static void can_setup() {
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO2/GPIO1 (v25 test)"));
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO20 (v26 test)"));
         return;
     }
     if (twai_start() != ESP_OK) {
@@ -532,7 +533,7 @@ static void can_setup() {
         return;
     }
     g_can_ready = true;
-    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO2, RX=GPIO1 - v25 test temporaire)"));
+    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO9, RX=GPIO20 - v26 test temporaire)"));
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
@@ -798,7 +799,7 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v22 (v25 : broches temporairement GPIO2/GPIO1, cf commentaire au-dessus
+    // v22 (v26 : broches temporairement GPIO9/GPIO20, cf commentaire au-dessus
     // de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
     // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
     // réutiliser par erreur pour autre chose.
