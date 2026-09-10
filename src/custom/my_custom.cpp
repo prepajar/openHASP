@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v23 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI + diagnostic bus-off)";
+    "v25 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO2/GPIO1 - diagnostic conflit USB natif GPIO19)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -438,9 +438,29 @@ static void sht20_state_machine_tick() {
 //
 // Utilise le driver TWAI natif d'ESP-IDF (driver/twai.h, inclus dans le
 // core arduino-esp32, aucune librairie externe à ajouter au build GitHub
-// Actions). Broches : connecteur 20 broches, EXT_IO3/EXT_IO4 -
-// CAN_TX (CTX) = GPIO19, CAN_RX (CRX) = GPIO7 (cf mémoire du projet -
-// plan de câblage validé).
+// Actions). Broches d'origine (v22-v24) : connecteur 20 broches,
+// EXT_IO3/EXT_IO4 - CAN_TX (CTX) = GPIO19, CAN_RX (CRX) = GPIO7.
+//
+// v25 - TEST DIAGNOSTIC TEMPORAIRE : à l'oscilloscope, AUCUNE activité
+// électrique constatée sur GPIO19 ET GPIO7 malgré des envois "réussis" côté
+// logiciel (mise en file d'attente OK, cf commentaire v23 plus bas) - le
+// matériel TWAI ne semble jamais réellement piloter ces broches. Sur
+// l'ESP32-S3 (chip du Panlee), GPIO19/GPIO20 sont les broches USB natif
+// fixées au niveau du silicium (D-/D+) - si l'option "USB CDC on Boot" (ou
+// équivalent) est active dans la configuration de build, le firmware
+// s'accapare GPIO19 en interne au démarrage même sans port USB natif
+// câblé, ce qui empêcherait le driver TWAI de piloter réellement la broche
+// malgré un retour ESP_OK à l'installation. Pour trancher sans ambiguïté,
+// bascule temporaire de test sur GPIO2/GPIO1 (pins 17-18 du connecteur,
+// TXD_EXT/RXD_EXT) - aucun rapport avec l'USB natif. ATTENTION : ces 2
+// broches sont câblées en interne à la puce RS485 SP3485 du Panlee (comm
+// EKRTCTRL2 abandonnée) - risque de charge/bruit sur le signal CAN, donc
+// affectation VOLONTAIREMENT TEMPORAIRE pour ce test, pas retenue comme
+// solution finale même si elle s'avère fonctionner (cf mémoire du projet).
+// Si l'activité apparaît ici à l'oscillo alors qu'elle était absente sur
+// GPIO19/GPIO7, ça confirme le conflit USB natif ; si toujours rien, le
+// problème est plus large (driver/compilation) et pas lié à un conflit de
+// broche particulier.
 //
 // NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
 // twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
@@ -450,8 +470,8 @@ static void sht20_state_machine_tick() {
 // update_dashboard_labels() depuis ici, même règle de sécurité que pour le
 // SHT20 (cf RÈGLE CRITIQUE au-dessus de custom_loop() plus bas).
 // =====================================================================
-static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_19;
-static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_7;
+static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_2;  // v25 test - etait GPIO_NUM_19
+static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_1;  // v25 test - etait GPIO_NUM_7
 static const uint32_t   CAN_HEARTBEAT_ID     = 0x100; // trame envoyée par le Panlee
 static const uint32_t   CAN_LISTEN_ID        = 0x200; // trame envoyée par l'ESP32 secondaire
 static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
@@ -485,11 +505,26 @@ static uint32_t g_can_next_send_ms = 0;
 static void can_setup() {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    // v24 - ALERTES TWAI (ESPlogs 41/43) : le code d'erreur brut (263 = 0x107 =
+    // ESP_ERR_TIMEOUT) confirme que l'échec est juste "file d'attente pleine"
+    // (pas une vraie erreur de bus), et le dump d'état (v23) montre TEC=0/
+    // REC=0/erreurs_bus=0 sur TOUTE la durée du test - donc aucune trame n'a
+    // même été comptée en échec au niveau matériel, ce qui est étrange si
+    // rien n'acquittait jamais (normalement chaque tentative sans accusé de
+    // réception incrémente le TEC). Pour lever le doute une bonne fois pour
+    // toutes, on active les ALERTES matérielles du driver TWAI - la SEULE
+    // façon fiable de savoir, trame par trame, si elle a été réellement
+    // acquittée (TWAI_ALERT_TX_SUCCESS) ou non (TWAI_ALERT_TX_FAILED),
+    // plutôt que d'inférer à partir du code retour de twai_transmit() (qui ne
+    // dit que si la mise en file a réussi, pas si l'émission a abouti).
+    g_config.alerts_enabled = TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED |
+                               TWAI_ALERT_RX_DATA    | TWAI_ALERT_BUS_ERROR |
+                               TWAI_ALERT_ERR_PASS    | TWAI_ALERT_BUS_OFF;
     twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_125KBITS();
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO19/GPIO7"));
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO2/GPIO1 (v25 test)"));
         return;
     }
     if (twai_start() != ESP_OK) {
@@ -497,7 +532,7 @@ static void can_setup() {
         return;
     }
     g_can_ready = true;
-    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO19, RX=GPIO7)"));
+    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO2, RX=GPIO1 - v25 test temporaire)"));
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
@@ -522,6 +557,32 @@ static void can_tick() {
             Serial.printf("[CAN] Echec envoi (id 0x100) : %s (code brut %d)\n", esp_err_to_name(err), (int)err);
         }
         g_can_next_send_ms = now + CAN_SEND_INTERVAL_MS;
+    }
+
+    // --- v24 : lit les alertes matérielles accumulées depuis le dernier tour
+    // (timeout=0, jamais bloquant) - preuve directe, trame par trame, d'un
+    // acquittement reussi ou non, independamment du code retour de
+    // twai_transmit() ci-dessus.
+    uint32_t alerts = 0;
+    if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0) {
+        if (alerts & TWAI_ALERT_TX_SUCCESS) {
+            Serial.println(F("[CAN] ALERTE : trame transmise ET ACQUITTEE avec succes sur le bus"));
+        }
+        if (alerts & TWAI_ALERT_TX_FAILED) {
+            Serial.println(F("[CAN] ALERTE : echec de transmission (non acquittee / arbitrage perdu)"));
+        }
+        if (alerts & TWAI_ALERT_RX_DATA) {
+            Serial.println(F("[CAN] ALERTE : trame(s) recue(s), disponible(s) via twai_receive()"));
+        }
+        if (alerts & TWAI_ALERT_BUS_ERROR) {
+            Serial.println(F("[CAN] ALERTE : erreur de bus (bit/stuff/crc/form) - signal electrique a verifier"));
+        }
+        if (alerts & TWAI_ALERT_ERR_PASS) {
+            Serial.println(F("[CAN] ALERTE : passage en etat erreur-passive (beaucoup d'erreurs accumulees)"));
+        }
+        if (alerts & TWAI_ALERT_BUS_OFF) {
+            Serial.println(F("[CAN] ALERTE : BUS_OFF"));
+        }
     }
 
     // --- Réception : draine toutes les trames en attente (timeout=0) ---
@@ -737,9 +798,10 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v22 : GPIO19/GPIO7 (CAN_TX/CAN_RX, TWAI) réservées explicitement ici
-    // pour éviter qu'une configuration GPIO openHASP (hasp config) ne
-    // vienne les réutiliser par erreur pour autre chose.
+    // v22 (v25 : broches temporairement GPIO2/GPIO1, cf commentaire au-dessus
+    // de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
+    // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
+    // réutiliser par erreur pour autre chose.
     if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
     return false;
 }
