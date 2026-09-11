@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v30 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI GPIO9/GPIO7 50kbps - retrait du force-HIGH logiciel GPIO9 (pull-up 10k materielle a la place), 1er heartbeat retarde 2s)";
+    "v31 (diagnostic CAN GPIO9/GPIO7 50kbps - SANS pull-up, liberation logicielle TX 1s + reinstallation TWAI automatique au 1er BUS_OFF)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -572,93 +572,139 @@ static void sht20_state_machine_tick() {
 // update_dashboard_labels() depuis ici, même règle de sécurité que pour le
 // SHT20 (cf RÈGLE CRITIQUE au-dessus de custom_loop() plus bas).
 // =====================================================================
-static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_9;  // v27 - deja GPIO_NUM_9 en v26, confirmee fonctionnelle
-static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_7;  // v27 test - etait GPIO_NUM_20 (v26), GPIO_NUM_1 (v25), GPIO_NUM_7 (v22-24, jamais confirmee seule)
-static const uint32_t   CAN_HEARTBEAT_ID     = 0x100; // trame envoyée par le Panlee
-static const uint32_t   CAN_LISTEN_ID        = 0x200; // trame envoyée par l'ESP32 secondaire
+static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_9;
+static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_7;
+static const uint32_t   CAN_HEARTBEAT_ID     = 0x100;
+static const uint32_t   CAN_LISTEN_ID        = 0x200;
 static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
+static const uint32_t   CAN_STATUS_INTERVAL_MS = 5000;
 
-// v23 - DIAGNOSTIC ÉTENDU + RÉCUPÉRATION AUTO BUS-OFF (ESPlogs 41) : le
-// premier test réel a montré ~6 envois réussis (mise en file d'attente OK)
-// puis des échecs "UNKNOWN ERROR" qui ne se sont plus jamais rétablis dans
-// la fenêtre du log. `twai_transmit()` avec timeout=0 ne dit QUE si la trame
-// a pu être mise en file (pas si elle a été acquittée sur le bus) - un
-// "succès" ne prouve donc pas à lui seul un lien bidirectionnel réel ; seule
-// la réception d'une trame de l'autre côté (log "Trame recue...") le prouve.
-// Ajout : (1) le code d'erreur BRUT (en plus du nom, potentiellement
-// "UNKNOWN ERROR" si non reconnu par esp_err_to_name()) pour pouvoir
-// identifier précisément la cause ; (2) un dump périodique (5s) de
-// twai_get_status_info() - état du contrôleur (RUNNING/BUS_OFF/RECOVERING/
-// STOPPED) + compteurs d'erreurs TX/RX - pour distinguer "personne n'accuse
-// réception" (file d'attente pleine, comportement normal sans partenaire) de
-// "vraie erreur de bus" (BUS_OFF, généralement câblage/terminaison/débit) ;
-// (3) récupération automatique si BUS_OFF est détecté (sinon le contrôleur
-// resterait bloqué indéfiniment sans intervention manuelle).
-static const uint32_t CAN_STATUS_INTERVAL_MS = 5000;
+static bool     g_can_ready          = false;
+static uint32_t g_can_next_send_ms   = 0;
 static uint32_t g_can_next_status_ms = 0;
 
-static bool     g_can_ready        = false;
-static uint32_t g_can_next_send_ms = 0;
+// =====================================================================
+// v31 - DIAGNOSTIC CIBLE : reproduire en logiciel le geste qui fonctionne
+// physiquement chez l'utilisateur : débrancher TX, attendre, rebrancher TX.
+//
+// IMPORTANT : pour CE TEST, retirer la résistance pull-up 10kΩ de GPIO9.
+// Le premier BUS_OFF déclenche UNE SEULE FOIS la séquence suivante :
+//   1) désinstallation complète du driver TWAI ;
+//   2) GPIO9 placé en INPUT (haute impédance) pendant 1 seconde ;
+//   3) réinstallation + redémarrage du TWAI ;
+//   4) attente de 2 secondes avant le premier heartbeat.
+//
+// Cette séquence est non bloquante : aucune delay() dans custom_loop().
+// Si le CAN fonctionne après cette séquence sans manipulation physique,
+// cela indiquera que la libération/réinitialisation de la voie TX est le
+// mécanisme utile derrière le débranchement/rebranchement manuel.
+// =====================================================================
+enum CanDiagState : uint8_t {
+    CAN_DIAG_NORMAL = 0,
+    CAN_DIAG_TX_RELEASED_WAIT,
+    CAN_DIAG_RESTARTED
+};
 
-// Installe et démarre le driver TWAI. Appelée une seule fois depuis
-// custom_setup(). Si l'installation échoue (broche déjà utilisée ailleurs,
-// etc.), g_can_ready reste false et can_tick() ne fait plus rien - pas de
-// blocage/crash, juste pas de CAN, comme le "capteur absent" du SHT20.
-static void can_setup() {
-    // v30 - le bloc pinMode(OUTPUT)/digitalWrite(HIGH)/delay(1000) de v29 est
-    // RETIRÉ ICI (voir commentaire au-dessus pour le raisonnement complet) :
-    // il pourrait empêcher twai_driver_install()/twai_start() de vraiment
-    // prendre le contrôle matériel de GPIO9 dans la matrice GPIO de
-    // l'ESP32-S3. L'état récessif au repos pendant le boot est désormais
-    // assuré UNIQUEMENT par la résistance de pull-up matérielle 10kΩ
-    // (GPIO9 -> 3.3V côté transceiver) - aucune ligne de code n'agit plus
-    // sur cette broche avant l'installation du driver TWAI.
-    Serial.println(F("[CAN] Initialisation TWAI - v30 (sans force-HIGH logiciel, pull-up 10k materielle seule)"));
+static CanDiagState g_can_diag_state = CAN_DIAG_NORMAL;
+static bool          g_can_diag_attempted = false;
+static uint32_t      g_can_diag_deadline_ms = 0;
 
+static bool can_install_and_start(const char* reason) {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
-    // v24 - ALERTES TWAI (ESPlogs 41/43) : le code d'erreur brut (263 = 0x107 =
-    // ESP_ERR_TIMEOUT) confirme que l'échec est juste "file d'attente pleine"
-    // (pas une vraie erreur de bus), et le dump d'état (v23) montre TEC=0/
-    // REC=0/erreurs_bus=0 sur TOUTE la durée du test - donc aucune trame n'a
-    // même été comptée en échec au niveau matériel, ce qui est étrange si
-    // rien n'acquittait jamais (normalement chaque tentative sans accusé de
-    // réception incrémente le TEC). Pour lever le doute une bonne fois pour
-    // toutes, on active les ALERTES matérielles du driver TWAI - la SEULE
-    // façon fiable de savoir, trame par trame, si elle a été réellement
-    // acquittée (TWAI_ALERT_TX_SUCCESS) ou non (TWAI_ALERT_TX_FAILED),
-    // plutôt que d'inférer à partir du code retour de twai_transmit() (qui ne
-    // dit que si la mise en file a réussi, pas si l'émission a abouti).
+
     g_config.alerts_enabled = TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED |
                                TWAI_ALERT_RX_DATA    | TWAI_ALERT_BUS_ERROR |
                                TWAI_ALERT_ERR_PASS    | TWAI_ALERT_BUS_OFF;
-    // v28 - debit reduit temporairement a 50kbps (bit de 20µs) pour verifier
-    // l'hypothese timing/qualite de signal - voir commentaire au-dessus de
-    // can_setup(). A remettre a TWAI_TIMING_CONFIG_125KBITS() une fois le
-    // test conclu.
-    twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_50KBITS();
-    twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v30 test)"));
-        return;
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_50KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        Serial.printf("[CAN][v31] Echec twai_driver_install (%s) : %s (%d)\n",
+                      reason, esp_err_to_name(err), (int)err);
+        g_can_ready = false;
+        return false;
     }
-    if (twai_start() != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_start()"));
-        return;
+
+    err = twai_start();
+    if (err != ESP_OK) {
+        Serial.printf("[CAN][v31] Echec twai_start (%s) : %s (%d)\n",
+                      reason, esp_err_to_name(err), (int)err);
+        (void)twai_driver_uninstall();
+        g_can_ready = false;
+        return false;
     }
+
     g_can_ready = true;
-    // v29 - retarde le tout premier battement de coeur de 2s apres
-    // twai_start() (au lieu d'emettre quasi immediatement) pour laisser le
-    // bus se stabiliser avant la premiere vraie trame. Conserve en v30.
     g_can_next_send_ms = millis() + 2000;
-    Serial.println(F("[CAN] Bus TWAI demarre (50kbps - v30, TX=GPIO9, RX=GPIO7, pull-up 10k materielle seule)"));
+    g_can_next_status_ms = millis() + CAN_STATUS_INTERVAL_MS;
+    Serial.printf("[CAN][v31] TWAI demarre (%s), 50kbps, TX=GPIO9, RX=GPIO7 - 1er heartbeat dans 2s\n", reason);
+    return true;
+}
+
+static void can_begin_tx_release_diagnostic(uint32_t now) {
+    if (g_can_diag_attempted) return;
+    g_can_diag_attempted = true;
+
+    Serial.println(F("[CAN][v31] === 1er BUS_OFF : debut diagnostic liberation TX ==="));
+    Serial.println(F("[CAN][v31] Desinstallation TWAI puis GPIO9 en haute impedance pendant 1s"));
+
+    // En BUS_OFF, twai_stop() peut retourner un état invalide selon la version
+    // ESP-IDF. On journalise le résultat mais on tente quand même uninstall().
+    esp_err_t err_stop = twai_stop();
+    Serial.printf("[CAN][v31] twai_stop() -> %s (%d)\n",
+                  esp_err_to_name(err_stop), (int)err_stop);
+
+    esp_err_t err_uninstall = twai_driver_uninstall();
+    Serial.printf("[CAN][v31] twai_driver_uninstall() -> %s (%d)\n",
+                  esp_err_to_name(err_uninstall), (int)err_uninstall);
+
+    if (err_uninstall != ESP_OK) {
+        Serial.println(F("[CAN][v31] Impossible de liberer le driver : diagnostic abandonne, recuperation TWAI classique"));
+        (void)twai_initiate_recovery();
+        return;
+    }
+
+    g_can_ready = false;
+
+    // Équivalent logiciel le plus proche du fil TX physiquement débranché :
+    // GPIO9 n'est plus piloté par le périphérique TWAI et passe en entrée.
+    pinMode((int)CAN_TX_GPIO, INPUT);
+    g_can_diag_state = CAN_DIAG_TX_RELEASED_WAIT;
+    g_can_diag_deadline_ms = now + 1000;
+    Serial.println(F("[CAN][v31] GPIO9 libere (INPUT/Hi-Z). Attente 1000ms..."));
+}
+
+static void can_diag_tick(uint32_t now) {
+    if (g_can_diag_state != CAN_DIAG_TX_RELEASED_WAIT) return;
+    if ((int32_t)(now - g_can_diag_deadline_ms) < 0) return;
+
+    Serial.println(F("[CAN][v31] Fin des 1000ms : reinstallation complete du TWAI..."));
+
+    if (can_install_and_start("apres liberation TX 1s")) {
+        g_can_diag_state = CAN_DIAG_RESTARTED;
+        Serial.println(F("[CAN][v31] === REDEMARRAGE TWAI OK : NE PAS toucher au fil TX, observer la suite ==="));
+    } else {
+        Serial.println(F("[CAN][v31] === ECHEC reinstallation TWAI apres liberation TX ==="));
+    }
+}
+
+static void can_setup() {
+    Serial.println(F("[CAN][v31] Initialisation CAN de diagnostic SANS pull-up 10k sur GPIO9"));
+    Serial.println(F("[CAN][v31] Au 1er BUS_OFF, GPIO9 sera libere 1s puis le driver TWAI sera reinstalle automatiquement"));
+    (void)can_install_and_start("demarrage initial");
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
 static void can_tick() {
-    if (!g_can_ready) return;
     uint32_t now = millis();
+
+    // Cette machine doit continuer à tourner même quand g_can_ready=false,
+    // puisque le driver est volontairement désinstallé pendant 1 seconde.
+    can_diag_tick(now);
+    if (!g_can_ready) return;
 
     // --- Envoi du battement de coeur toutes les 2s ---
     if ((int32_t)(now - g_can_next_send_ms) >= 0) {
@@ -668,57 +714,55 @@ static void can_tick() {
         msg.data[0] = 0xAA;
         msg.data[1] = 0x55;
 
-        esp_err_t err = twai_transmit(&msg, 0); // timeout=0 -> jamais bloquant
+        esp_err_t err = twai_transmit(&msg, 0);
         if (err == ESP_OK) {
-            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100) [mise en file OK - ne prouve pas a lui seul un acquittement reel]"));
+            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100) [mise en file OK - attente ACK reel]"));
         } else {
-            // v23 : code brut en plus du nom - esp_err_to_name() peut renvoyer
-            // "UNKNOWN ERROR" pour un code non enregistre dans sa table.
-            Serial.printf("[CAN] Echec envoi (id 0x100) : %s (code brut %d)\n", esp_err_to_name(err), (int)err);
+            Serial.printf("[CAN] Echec envoi (id 0x100) : %s (code brut %d)\n",
+                          esp_err_to_name(err), (int)err);
         }
         g_can_next_send_ms = now + CAN_SEND_INTERVAL_MS;
     }
 
-    // --- v24 : lit les alertes matérielles accumulées depuis le dernier tour
-    // (timeout=0, jamais bloquant) - preuve directe, trame par trame, d'un
-    // acquittement reussi ou non, independamment du code retour de
-    // twai_transmit() ci-dessus.
+    // --- Alertes matérielles TWAI ---
     uint32_t alerts = 0;
     if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0) {
         if (alerts & TWAI_ALERT_TX_SUCCESS) {
-            Serial.println(F("[CAN] ALERTE : trame transmise ET ACQUITTEE avec succes sur le bus"));
+            Serial.println(F("[CAN] >>> TX_SUCCESS : trame transmise ET ACQUITTEE <<<"));
         }
         if (alerts & TWAI_ALERT_TX_FAILED) {
-            Serial.println(F("[CAN] ALERTE : echec de transmission (non acquittee / arbitrage perdu)"));
+            Serial.println(F("[CAN] ALERTE : echec de transmission / absence ACK"));
         }
         if (alerts & TWAI_ALERT_RX_DATA) {
-            Serial.println(F("[CAN] ALERTE : trame(s) recue(s), disponible(s) via twai_receive()"));
+            Serial.println(F("[CAN] >>> RX_DATA : trame recue <<<"));
         }
         if (alerts & TWAI_ALERT_BUS_ERROR) {
-            Serial.println(F("[CAN] ALERTE : erreur de bus (bit/stuff/crc/form) - signal electrique a verifier"));
+            Serial.println(F("[CAN] ALERTE : erreur de bus (bit/stuff/crc/form)"));
         }
         if (alerts & TWAI_ALERT_ERR_PASS) {
-            Serial.println(F("[CAN] ALERTE : passage en etat erreur-passive (beaucoup d'erreurs accumulees)"));
+            Serial.println(F("[CAN] ALERTE : passage erreur-passive"));
         }
         if (alerts & TWAI_ALERT_BUS_OFF) {
             Serial.println(F("[CAN] ALERTE : BUS_OFF"));
         }
     }
 
-    // --- Réception : draine toutes les trames en attente (timeout=0) ---
+    // --- Réception ---
     twai_message_t rx_msg;
     while (twai_receive(&rx_msg, 0) == ESP_OK) {
+        Serial.printf("[CAN] Trame recue id=0x%03X, %d octet(s) :",
+                      (unsigned)rx_msg.identifier, rx_msg.data_length_code);
+        for (int i = 0; i < rx_msg.data_length_code; i++) {
+            Serial.printf(" %02X", rx_msg.data[i]);
+        }
+        Serial.println();
+
         if (rx_msg.identifier == CAN_LISTEN_ID) {
-            Serial.printf("[CAN] Trame recue de l'ESP32 secondaire - id: 0x%03X, %d octet(s) :",
-                          (unsigned)rx_msg.identifier, rx_msg.data_length_code);
-            for (int i = 0; i < rx_msg.data_length_code; i++) {
-                Serial.printf(" %02X", rx_msg.data[i]);
-            }
-            Serial.println();
+            Serial.println(F("[CAN] >>> HEARTBEAT 0x200 ESP32 SECONDAIRE RECU : liaison valide dans ce sens <<<"));
         }
     }
 
-    // --- v23 : dump périodique de l'état du contrôleur TWAI (toutes les 5s) ---
+    // --- État périodique ---
     if ((int32_t)(now - g_can_next_status_ms) >= 0) {
         twai_status_info_t status;
         if (twai_get_status_info(&status) == ESP_OK) {
@@ -730,23 +774,33 @@ static void can_tick() {
                 case TWAI_STATE_RECOVERING: state_str = "RECOVERING"; break;
                 default:                    state_str = "?";          break;
             }
-            Serial.printf("[CAN] Etat bus : %s, TEC=%u, REC=%u, en_attente_tx=%u, en_attente_rx=%u, erreurs_bus=%u, ratees_rx=%u\n",
-                          state_str, (unsigned)status.tx_error_counter, (unsigned)status.rx_error_counter,
-                          (unsigned)status.msgs_to_tx, (unsigned)status.msgs_to_rx,
-                          (unsigned)status.bus_error_count, (unsigned)status.rx_missed_count);
+
+            Serial.printf("[CAN] Etat bus : %s, TEC=%u, REC=%u, txq=%u, rxq=%u, erreurs_bus=%u, ratees_rx=%u, diag=%s\n",
+                          state_str,
+                          (unsigned)status.tx_error_counter,
+                          (unsigned)status.rx_error_counter,
+                          (unsigned)status.msgs_to_tx,
+                          (unsigned)status.msgs_to_rx,
+                          (unsigned)status.bus_error_count,
+                          (unsigned)status.rx_missed_count,
+                          g_can_diag_attempted ? "DEJA_EFFECTUE" : "PAS_ENCORE");
 
             if (status.state == TWAI_STATE_BUS_OFF) {
-                // Trop d'erreurs de bus accumulees (typiquement cablage/
-                // terminaison/debit incorrect) - sans ca le controleur
-                // resterait bloque indefiniment tant que rien ne relance
-                // manuellement la recuperation.
-                Serial.println(F("[CAN] BUS_OFF detecte - lancement de la recuperation..."));
-                twai_initiate_recovery();
+                if (!g_can_diag_attempted) {
+                    can_begin_tx_release_diagnostic(now);
+                    // Le driver peut avoir été désinstallé ci-dessus.
+                    return;
+                } else {
+                    Serial.println(F("[CAN][v31] BUS_OFF apres diagnostic : recuperation TWAI classique"));
+                    (void)twai_initiate_recovery();
+                }
             } else if (status.state == TWAI_STATE_STOPPED) {
-                // Arrive apres une recuperation BUS_OFF reussie (ou tout
-                // autre arret inattendu) - relance le controleur.
-                Serial.println(F("[CAN] Controleur a l'arret - redemarrage..."));
-                twai_start();
+                Serial.println(F("[CAN] Controleur STOPPED - redemarrage twai_start()"));
+                esp_err_t err = twai_start();
+                Serial.printf("[CAN] twai_start() -> %s (%d)\n", esp_err_to_name(err), (int)err);
+                if (err == ESP_OK) {
+                    g_can_next_send_ms = now + 2000;
+                }
             }
         }
         g_can_next_status_ms = now + CAN_STATUS_INTERVAL_MS;
@@ -918,8 +972,8 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v22 (v29 : broches temporairement GPIO9/GPIO7 a 50kbps, GPIO9 force
-    // HIGH avant TWAI, cf commentaire au-dessus de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
+    // v31 : CAN sur GPIO9/GPIO7 a 50kbps pour diagnostic. CAN_TX/CAN_RX
+    // réservées explicitement ici pour
     // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
     // réutiliser par erreur pour autre chose.
     if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
