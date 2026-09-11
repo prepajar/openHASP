@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v28 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO9/GPIO7 a 50kbps - debit reduit pour verifier hypothese timing/qualite signal)";
+    "v29 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI GPIO9/GPIO7 50kbps - GPIO9 force HIGH avant twai_start(), 1er heartbeat retarde 2s)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -495,6 +495,41 @@ static void sht20_state_machine_tick() {
 // il faut chercher un défaut électrique encore non identifié, indépendant de
 // la vitesse.
 //
+// v28 résultat (ESPlogs 56/57/58) : déluge identique à 50kbps qu'à 125kbps -
+// débit écarté. MAIS observation nouvelle et très cohérente sur plusieurs
+// essais : dès le boot, les erreurs commencent quasi immédiatement (parfois
+// BUS_OFF en seulement 8s), et le fait de débrancher puis rebrancher le fil
+// TX (GPIO9->CTX) semble à chaque fois faire "repartir" le bus proprement.
+// Hypothèse retenue (analyse tierce, cohérente avec le comportement documenté
+// du driver TWAI ESP-IDF) : au tout début du boot de l'ESP32-S3, avant que
+// twai_driver_install()/twai_start() ne prenne le contrôle de GPIO9, l'état
+// de cette broche n'est pas garanti (flottant ou indéterminé pendant les
+// premières ms du reset). Si le SN65HVD230 lit un niveau bas (dominant) sur
+// son entrée D/TXD pendant cette fenêtre, il polluerait le bus dès le
+// démarrage, avant même que quoi que ce soit de valide ait pu être échangé -
+// cohérent avec l'apparition quasi instantanée des erreurs. Débrancher TX
+// isole cette entrée du transceiver le temps que GPIO9 soit repris
+// proprement par le driver TWAI (qui le met au repos récessif/HIGH une fois
+// actif) ; rebrancher ensuite ne réintroduit pas le problème puisque GPIO9
+// est déjà piloté correctement à ce moment-là. N'explique pas à lui seul les
+// épisodes de ré-accumulation d'erreurs observés plusieurs dizaines de
+// secondes après un démarrage propre (ESPlogs 56/57) - il pourrait y avoir
+// plus d'une cause, à surveiller.
+//
+// v29 - CORRECTIF CIBLÉ : force GPIO9 en sortie HIGH (récessif) AVANT
+// d'installer/démarrer le driver TWAI, avec un court délai de stabilisation,
+// pour garantir que le SN65HVD230 ne voit jamais un niveau bas parasite sur
+// son entrée D/TXD pendant le boot - sans avoir besoin de débrancher/
+// rebrancher TX manuellement. Ajout aussi d'un délai de 2s avant le premier
+// battement de coeur réel (au lieu d'émettre quasi immédiatement après
+// twai_start()), pour laisser le bus se stabiliser. Câblage et débit
+// inchangés (GPIO9/GPIO7, 50kbps) - un seul changement à la fois par rapport
+// à v28, conformément à la méthode suivie depuis le début de ce diagnostic.
+// Note : l'ajout d'une résistance de pull-up matérielle (10kΩ entre GPIO9 et
+// 3.3V côté transceiver) proposée en complément n'est PAS incluse dans ce
+// test - à envisager séparément seulement si le correctif logiciel seul ne
+// suffit pas, pour ne pas mélanger deux variables dans le même essai.
+//
 // NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
 // twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
 // donc ils retournent immédiatement (succès, mailbox pleine, ou rien à
@@ -536,6 +571,17 @@ static uint32_t g_can_next_send_ms = 0;
 // etc.), g_can_ready reste false et can_tick() ne fait plus rien - pas de
 // blocage/crash, juste pas de CAN, comme le "capteur absent" du SHT20.
 static void can_setup() {
+    // v29 - force GPIO9 (CAN_TX_GPIO) au repos recessif (HIGH) AVANT que le
+    // driver TWAI ne prenne la broche, pour eviter que le SN65HVD230 ne voie
+    // un niveau bas parasite/indetermine pendant la sequence de boot (voir
+    // commentaire au-dessus). custom_setup() tourne une seule fois au
+    // demarrage - un delay() bloquant ici est sans consequence (regle
+    // "jamais de delay()" ne s'applique qu'a custom_loop()/can_tick()).
+    pinMode((int)CAN_TX_GPIO, OUTPUT);
+    digitalWrite((int)CAN_TX_GPIO, HIGH);
+    Serial.println(F("[CAN] GPIO9 force HIGH (recessif) avant initialisation TWAI - v29"));
+    delay(1000);
+
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
     // v24 - ALERTES TWAI (ESPlogs 41/43) : le code d'erreur brut (263 = 0x107 =
@@ -561,7 +607,7 @@ static void can_setup() {
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v28 test)"));
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v29 test)"));
         return;
     }
     if (twai_start() != ESP_OK) {
@@ -569,7 +615,11 @@ static void can_setup() {
         return;
     }
     g_can_ready = true;
-    Serial.println(F("[CAN] Bus TWAI demarre (50kbps - v28 test debit reduit, TX=GPIO9, RX=GPIO7)"));
+    // v29 - retarde le tout premier battement de coeur de 2s apres
+    // twai_start() (au lieu d'emettre quasi immediatement) pour laisser le
+    // bus se stabiliser avant la premiere vraie trame.
+    g_can_next_send_ms = millis() + 2000;
+    Serial.println(F("[CAN] Bus TWAI demarre apres stabilisation TX (50kbps - v29, TX=GPIO9, RX=GPIO7)"));
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
@@ -835,8 +885,8 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v22 (v28 : broches temporairement GPIO9/GPIO7 a 50kbps, cf commentaire
-    // au-dessus de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
+    // v22 (v29 : broches temporairement GPIO9/GPIO7 a 50kbps, GPIO9 force
+    // HIGH avant TWAI, cf commentaire au-dessus de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
     // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
     // réutiliser par erreur pour autre chose.
     if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
