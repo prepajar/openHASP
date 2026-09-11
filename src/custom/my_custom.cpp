@@ -1,4 +1,3 @@
-
 // =====================================================================
 // my_custom.cpp - Lecture du capteur température/humidité SHT20 embarqué
 // sur le panneau ZX3D95CE01S-TR-4848 (Panlee), intégrée dans openHASP via
@@ -70,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v27 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO9/GPIO7 - evite USB natif ET RS485)";
+    "v28 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI sur GPIO9/GPIO7 a 50kbps - debit reduit pour verifier hypothese timing/qualite signal)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -474,6 +473,28 @@ static void sht20_state_machine_tick() {
 // requis : GPIO9 -> CTX du transceiver (inchangé), GPIO7 -> CRX du
 // transceiver (à la place de GPIO20).
 //
+// v27 seul (ESPlogs 53) : propre - mais AUCUN partenaire réel actif au bon
+// moment (TEC=REC=erreurs_bus=0 en permanence). Avec l'ESP32 secondaire
+// réellement actif (ESPlogs 55, 12/09/2026) : MÊME déluge continu que v26
+// (TEC grimpe vite en erreur-passive, erreurs_bus dans les milliers en
+// quelques secondes) alors que GPIO7 (RX) est différent de GPIO20 (RX v26) -
+// seul GPIO9 (TX) est commun aux 2 tests. Polarité CANH/CANL, débit annoncé
+// (125kbps des 2 côtés), masse commune, câblage CTX/CRX et module
+// transceiver ont tous été vérifiés/écartés un par un. Mesures à l'oscillo à
+// 125kbps non concluantes (le DSO Shell, ~200kHz de bande passante, lisse
+// tout signal aussi rapide qu'un bit CAN de 8µs - impossible de confirmer ou
+// d'infirmer le timing réel à l'oeil sur cet appareil à cette vitesse).
+//
+// v28 - TEST DIAGNOSTIC TEMPORAIRE #4 : bascule du débit CAN de 125kbps à
+// 50kbps (bit de 20µs au lieu de 8µs - dans les capacités du DSO Shell) des
+// DEUX côtés (Panlee ET secondaire, cf esp32_secondaire_can_test.yaml), sans
+// toucher au câblage GPIO9/GPIO7 déjà en place. Objectif : si le déluge
+// disparaît à 50kbps, ça confirme un problème de timing/qualité de signal
+// marginal à 125kbps (càble, capacité parasite, temps de montée du
+// transceiver) ; si le déluge persiste même à 50kbps, le débit est écarté et
+// il faut chercher un défaut électrique encore non identifié, indépendant de
+// la vitesse.
+//
 // NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
 // twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
 // donc ils retournent immédiatement (succès, mailbox pleine, ou rien à
@@ -532,11 +553,15 @@ static void can_setup() {
     g_config.alerts_enabled = TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED |
                                TWAI_ALERT_RX_DATA    | TWAI_ALERT_BUS_ERROR |
                                TWAI_ALERT_ERR_PASS    | TWAI_ALERT_BUS_OFF;
-    twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_125KBITS();
+    // v28 - debit reduit temporairement a 50kbps (bit de 20µs) pour verifier
+    // l'hypothese timing/qualite de signal - voir commentaire au-dessus de
+    // can_setup(). A remettre a TWAI_TIMING_CONFIG_125KBITS() une fois le
+    // test conclu.
+    twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_50KBITS();
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v27 test)"));
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v28 test)"));
         return;
     }
     if (twai_start() != ESP_OK) {
@@ -544,7 +569,7 @@ static void can_setup() {
         return;
     }
     g_can_ready = true;
-    Serial.println(F("[CAN] Bus TWAI demarre (125kbps, TX=GPIO9, RX=GPIO7 - v27 test temporaire)"));
+    Serial.println(F("[CAN] Bus TWAI demarre (50kbps - v28 test debit reduit, TX=GPIO9, RX=GPIO7)"));
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
@@ -810,8 +835,8 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v22 (v27 : broches temporairement GPIO9/GPIO7, cf commentaire au-dessus
-    // de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
+    // v22 (v28 : broches temporairement GPIO9/GPIO7 a 50kbps, cf commentaire
+    // au-dessus de can_setup()) : CAN_TX/CAN_RX (TWAI) réservées explicitement ici pour
     // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
     // réutiliser par erreur pour autre chose.
     if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
