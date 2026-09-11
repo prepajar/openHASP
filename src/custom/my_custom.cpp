@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v29 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI GPIO9/GPIO7 50kbps - GPIO9 force HIGH avant twai_start(), 1er heartbeat retarde 2s)";
+    "v30 (anti-rebond 150ms + filet 6 pas/1s + acceleration du pas consigne + test CAN TWAI GPIO9/GPIO7 50kbps - retrait du force-HIGH logiciel GPIO9 (pull-up 10k materielle a la place), 1er heartbeat retarde 2s)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -530,6 +530,40 @@ static void sht20_state_machine_tick() {
 // test - à envisager séparément seulement si le correctif logiciel seul ne
 // suffit pas, pour ne pas mélanger deux variables dans le même essai.
 //
+// v29 résultat (ESPlogs 59) : le correctif logiciel seul n'a RIEN changé -
+// "c'est pareil" confirmé par le log : bus parfaitement propre (TEC=REC=
+// erreurs_bus=0) pendant toute la phase de stabilisation, PUIS déluge
+// d'erreurs qui démarre à l'instant EXACT du tout premier battement de coeur
+// émis (2s après twai_start(), comme prévu). Ça réfute l'hypothèse "état
+// indéterminé de GPIO9 au boot pollue le bus" - le bus était démontré sain
+// avant toute émission. La panne n'est donc pas liée au BOOT mais à l'ACTE
+// D'ÉMISSION lui-même. Ensuite l'utilisatrice a ajouté la résistance de
+// pull-up matérielle 10kΩ (GPIO9->3.3V côté transceiver) SANS retirer ce
+// correctif logiciel (ESPlogs 60) : même conclusion (toujours zéro trame
+// échangée), mais la manifestation change - BUS_OFF complet et quasi
+// instantané dès le 1er battement (au lieu de rester bloqué en erreur-
+// passive), avec un cycle parfaitement répétitif toutes les ~10s et
+// `erreurs_bus` figé à EXACTEMENT 31 à chaque cycle (signature déterministe,
+// pas du bruit aléatoire).
+//
+// v30 - RETRAIT DU FORCE-HIGH LOGICIEL (résistance matérielle conservée) :
+// après vérification à l'oscilloscope en mode NORM/HOLD (pas AUTO), aucune
+// activité électrique constatée sur GPIO9/GPIO7 malgré les logs logiciels
+// montrant des tentatives d'émission régulières ("Battement de coeur
+// envoye"). Hypothèse à tester (analyse tierce, jugée plausible) : le bloc
+// `pinMode(OUTPUT); digitalWrite(HIGH); delay(1000);` ajouté en v29 AVANT
+// `twai_driver_install()` pourrait interférer avec la prise de contrôle
+// réelle de la broche GPIO9 par le driver TWAI (matrice GPIO de l'ESP32-S3),
+// empêchant le périphérique TWAI de réellement piloter la broche même si
+// `twai_start()` retourne ESP_OK - cohérent avec le fait qu'une activité
+// carrée franche avait bien été observée à l'oscillo sur GPIO9 AVANT
+// l'introduction de ce bloc (v26/v27, tests du 11-12/09). Ce test retire
+// uniquement ce bloc logiciel (pinMode/digitalWrite/delay) et ne garde QUE
+// `twai_driver_install()`/`twai_start()` - la résistance de pull-up 10kΩ
+// matérielle assure seule l'état récessif au repos pendant le boot. Un seul
+// changement à la fois par rapport à v29+pull-up (ESPlogs 60) : câblage,
+// débit (50kbps) et délai de 2s avant le 1er battement inchangés.
+//
 // NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
 // twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
 // donc ils retournent immédiatement (succès, mailbox pleine, ou rien à
@@ -571,16 +605,15 @@ static uint32_t g_can_next_send_ms = 0;
 // etc.), g_can_ready reste false et can_tick() ne fait plus rien - pas de
 // blocage/crash, juste pas de CAN, comme le "capteur absent" du SHT20.
 static void can_setup() {
-    // v29 - force GPIO9 (CAN_TX_GPIO) au repos recessif (HIGH) AVANT que le
-    // driver TWAI ne prenne la broche, pour eviter que le SN65HVD230 ne voie
-    // un niveau bas parasite/indetermine pendant la sequence de boot (voir
-    // commentaire au-dessus). custom_setup() tourne une seule fois au
-    // demarrage - un delay() bloquant ici est sans consequence (regle
-    // "jamais de delay()" ne s'applique qu'a custom_loop()/can_tick()).
-    pinMode((int)CAN_TX_GPIO, OUTPUT);
-    digitalWrite((int)CAN_TX_GPIO, HIGH);
-    Serial.println(F("[CAN] GPIO9 force HIGH (recessif) avant initialisation TWAI - v29"));
-    delay(1000);
+    // v30 - le bloc pinMode(OUTPUT)/digitalWrite(HIGH)/delay(1000) de v29 est
+    // RETIRÉ ICI (voir commentaire au-dessus pour le raisonnement complet) :
+    // il pourrait empêcher twai_driver_install()/twai_start() de vraiment
+    // prendre le contrôle matériel de GPIO9 dans la matrice GPIO de
+    // l'ESP32-S3. L'état récessif au repos pendant le boot est désormais
+    // assuré UNIQUEMENT par la résistance de pull-up matérielle 10kΩ
+    // (GPIO9 -> 3.3V côté transceiver) - aucune ligne de code n'agit plus
+    // sur cette broche avant l'installation du driver TWAI.
+    Serial.println(F("[CAN] Initialisation TWAI - v30 (sans force-HIGH logiciel, pull-up 10k materielle seule)"));
 
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
@@ -607,7 +640,7 @@ static void can_setup() {
     twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v29 test)"));
+        Serial.println(F("[CAN] Echec twai_driver_install() - verifier GPIO9/GPIO7 (v30 test)"));
         return;
     }
     if (twai_start() != ESP_OK) {
@@ -617,9 +650,9 @@ static void can_setup() {
     g_can_ready = true;
     // v29 - retarde le tout premier battement de coeur de 2s apres
     // twai_start() (au lieu d'emettre quasi immediatement) pour laisser le
-    // bus se stabiliser avant la premiere vraie trame.
+    // bus se stabiliser avant la premiere vraie trame. Conserve en v30.
     g_can_next_send_ms = millis() + 2000;
-    Serial.println(F("[CAN] Bus TWAI demarre apres stabilisation TX (50kbps - v29, TX=GPIO9, RX=GPIO7)"));
+    Serial.println(F("[CAN] Bus TWAI demarre (50kbps - v30, TX=GPIO9, RX=GPIO7, pull-up 10k materielle seule)"));
 }
 
 // Non bloquante, appelée depuis custom_loop() à chaque itération.
