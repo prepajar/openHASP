@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v31 (diagnostic CAN GPIO9/GPIO7 50kbps - SANS pull-up, liberation logicielle TX 1s + reinstallation TWAI automatique au 1er BUS_OFF)";
+    "v32 (diagnostic CAN GPIO9/GPIO7 50kbps - SANS pull-up, liberation logicielle TX 1s declenchee des erreur-passive (TEC>=128), pas seulement BUS_OFF)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -598,6 +598,28 @@ static uint32_t g_can_next_status_ms = 0;
 // Si le CAN fonctionne après cette séquence sans manipulation physique,
 // cela indiquera que la libération/réinitialisation de la voie TX est le
 // mécanisme utile derrière le débranchement/rebranchement manuel.
+//
+// v31 résultat (ESPlogs 62) : le diagnostic ne s'est JAMAIS déclenché - le
+// contrôleur est resté en TWAI_STATE_RUNNING avec TEC=128 (erreur-passive)
+// pendant toute la durée du test (18s), erreurs_bus grimpant sans fin
+// (1902 -> 5067 -> 8232), sans jamais atteindre un vrai TWAI_STATE_BUS_OFF -
+// exactement le même pattern que v29 SANS pull-up (ESPlogs 59). Corrélation
+// nette sur l'ensemble des tests à ce stade : AVEC la résistance de pull-up
+// 10kΩ (ESPlogs 60 en v29, ESPlogs 61 en v30), le contrôleur bascule
+// rapidement en BUS_OFF complet ; SANS elle (ESPlogs 59 en v29, ESPlogs 62
+// en v31), il reste indéfiniment bloqué en erreur-passive (TEC=128 fixe)
+// sans jamais franchir le seuil BUS_OFF (256). Le déclencheur du diagnostic
+// v31 (condition stricte `status.state == TWAI_STATE_BUS_OFF`) ne pouvait
+// donc pas s'activer dans cette configuration matérielle - le test n'a pas
+// infirmé le mécanisme de libération TX, il n'a simplement jamais eu
+// l'occasion de s'exécuter.
+//
+// v32 - DÉCLENCHEMENT ÉLARGI : le diagnostic se déclenche maintenant dès que
+// TEC>=128 est observé (erreur-passive), que l'état rapporté soit RUNNING ou
+// BUS_OFF - plus besoin d'atteindre le seuil BUS_OFF (256) qui ne semble
+// jamais franchi sans la résistance de pull-up. Reste sans pull-up (câblage
+// matériel inchangé depuis v31) - un seul changement à la fois (le
+// déclencheur), pas le câblage.
 // =====================================================================
 enum CanDiagState : uint8_t {
     CAN_DIAG_NORMAL = 0,
@@ -622,7 +644,7 @@ static bool can_install_and_start(const char* reason) {
 
     esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
     if (err != ESP_OK) {
-        Serial.printf("[CAN][v31] Echec twai_driver_install (%s) : %s (%d)\n",
+        Serial.printf("[CAN][v32] Echec twai_driver_install (%s) : %s (%d)\n",
                       reason, esp_err_to_name(err), (int)err);
         g_can_ready = false;
         return false;
@@ -630,7 +652,7 @@ static bool can_install_and_start(const char* reason) {
 
     err = twai_start();
     if (err != ESP_OK) {
-        Serial.printf("[CAN][v31] Echec twai_start (%s) : %s (%d)\n",
+        Serial.printf("[CAN][v32] Echec twai_start (%s) : %s (%d)\n",
                       reason, esp_err_to_name(err), (int)err);
         (void)twai_driver_uninstall();
         g_can_ready = false;
@@ -640,7 +662,7 @@ static bool can_install_and_start(const char* reason) {
     g_can_ready = true;
     g_can_next_send_ms = millis() + 2000;
     g_can_next_status_ms = millis() + CAN_STATUS_INTERVAL_MS;
-    Serial.printf("[CAN][v31] TWAI demarre (%s), 50kbps, TX=GPIO9, RX=GPIO7 - 1er heartbeat dans 2s\n", reason);
+    Serial.printf("[CAN][v32] TWAI demarre (%s), 50kbps, TX=GPIO9, RX=GPIO7 - 1er heartbeat dans 2s\n", reason);
     return true;
 }
 
@@ -648,21 +670,22 @@ static void can_begin_tx_release_diagnostic(uint32_t now) {
     if (g_can_diag_attempted) return;
     g_can_diag_attempted = true;
 
-    Serial.println(F("[CAN][v31] === 1er BUS_OFF : debut diagnostic liberation TX ==="));
-    Serial.println(F("[CAN][v31] Desinstallation TWAI puis GPIO9 en haute impedance pendant 1s"));
+    Serial.println(F("[CAN][v32] === Seuil erreur-passive/BUS_OFF atteint : debut diagnostic liberation TX ==="));
+    Serial.println(F("[CAN][v32] Desinstallation TWAI puis GPIO9 en haute impedance pendant 1s"));
 
-    // En BUS_OFF, twai_stop() peut retourner un état invalide selon la version
-    // ESP-IDF. On journalise le résultat mais on tente quand même uninstall().
+    // En BUS_OFF ou en erreur-passive prolongee, twai_stop() peut retourner un
+    // état invalide selon la version ESP-IDF. On journalise le résultat mais
+    // on tente quand même uninstall().
     esp_err_t err_stop = twai_stop();
-    Serial.printf("[CAN][v31] twai_stop() -> %s (%d)\n",
+    Serial.printf("[CAN][v32] twai_stop() -> %s (%d)\n",
                   esp_err_to_name(err_stop), (int)err_stop);
 
     esp_err_t err_uninstall = twai_driver_uninstall();
-    Serial.printf("[CAN][v31] twai_driver_uninstall() -> %s (%d)\n",
+    Serial.printf("[CAN][v32] twai_driver_uninstall() -> %s (%d)\n",
                   esp_err_to_name(err_uninstall), (int)err_uninstall);
 
     if (err_uninstall != ESP_OK) {
-        Serial.println(F("[CAN][v31] Impossible de liberer le driver : diagnostic abandonne, recuperation TWAI classique"));
+        Serial.println(F("[CAN][v32] Impossible de liberer le driver : diagnostic abandonne, recuperation TWAI classique"));
         (void)twai_initiate_recovery();
         return;
     }
@@ -674,26 +697,26 @@ static void can_begin_tx_release_diagnostic(uint32_t now) {
     pinMode((int)CAN_TX_GPIO, INPUT);
     g_can_diag_state = CAN_DIAG_TX_RELEASED_WAIT;
     g_can_diag_deadline_ms = now + 1000;
-    Serial.println(F("[CAN][v31] GPIO9 libere (INPUT/Hi-Z). Attente 1000ms..."));
+    Serial.println(F("[CAN][v32] GPIO9 libere (INPUT/Hi-Z). Attente 1000ms..."));
 }
 
 static void can_diag_tick(uint32_t now) {
     if (g_can_diag_state != CAN_DIAG_TX_RELEASED_WAIT) return;
     if ((int32_t)(now - g_can_diag_deadline_ms) < 0) return;
 
-    Serial.println(F("[CAN][v31] Fin des 1000ms : reinstallation complete du TWAI..."));
+    Serial.println(F("[CAN][v32] Fin des 1000ms : reinstallation complete du TWAI..."));
 
     if (can_install_and_start("apres liberation TX 1s")) {
         g_can_diag_state = CAN_DIAG_RESTARTED;
-        Serial.println(F("[CAN][v31] === REDEMARRAGE TWAI OK : NE PAS toucher au fil TX, observer la suite ==="));
+        Serial.println(F("[CAN][v32] === REDEMARRAGE TWAI OK : NE PAS toucher au fil TX, observer la suite ==="));
     } else {
-        Serial.println(F("[CAN][v31] === ECHEC reinstallation TWAI apres liberation TX ==="));
+        Serial.println(F("[CAN][v32] === ECHEC reinstallation TWAI apres liberation TX ==="));
     }
 }
 
 static void can_setup() {
-    Serial.println(F("[CAN][v31] Initialisation CAN de diagnostic SANS pull-up 10k sur GPIO9"));
-    Serial.println(F("[CAN][v31] Au 1er BUS_OFF, GPIO9 sera libere 1s puis le driver TWAI sera reinstalle automatiquement"));
+    Serial.println(F("[CAN][v32] Initialisation CAN de diagnostic SANS pull-up 10k sur GPIO9"));
+    Serial.println(F("[CAN][v32] A TEC>=128 ou BUS_OFF, GPIO9 sera libere 1s puis le driver TWAI sera reinstalle automatiquement"));
     (void)can_install_and_start("demarrage initial");
 }
 
@@ -785,15 +808,28 @@ static void can_tick() {
                           (unsigned)status.rx_missed_count,
                           g_can_diag_attempted ? "DEJA_EFFECTUE" : "PAS_ENCORE");
 
-            if (status.state == TWAI_STATE_BUS_OFF) {
+            // v32 - ESPlogs62 (v31) : sans la resistance de pull-up, le
+            // controleur reste bloque en TWAI_STATE_RUNNING avec TEC=128
+            // (erreur-passive) indefiniment, sans jamais atteindre
+            // TWAI_STATE_BUS_OFF (256) - la condition stricte de v31 ne se
+            // declenchait donc jamais. Elargie ici : TEC>=128 suffit,
+            // quel que soit l'etat rapporte (RUNNING ou BUS_OFF).
+            bool needs_recovery = (status.state == TWAI_STATE_BUS_OFF) ||
+                                   (status.tx_error_counter >= 128);
+            if (needs_recovery) {
                 if (!g_can_diag_attempted) {
+                    Serial.printf("[CAN][v32] Seuil erreur-passive/BUS_OFF atteint (TEC=%u, etat=%s) - declenchement diagnostic\n",
+                                  (unsigned)status.tx_error_counter, state_str);
                     can_begin_tx_release_diagnostic(now);
                     // Le driver peut avoir été désinstallé ci-dessus.
                     return;
-                } else {
-                    Serial.println(F("[CAN][v31] BUS_OFF apres diagnostic : recuperation TWAI classique"));
+                } else if (status.state == TWAI_STATE_BUS_OFF) {
+                    Serial.println(F("[CAN][v32] BUS_OFF apres diagnostic : recuperation TWAI classique"));
                     (void)twai_initiate_recovery();
                 }
+                // Si deja tente ET juste erreur-passive (pas BUS_OFF), on
+                // laisse le controleur continuer tel quel - pas de nouvelle
+                // action tant qu'il ne passe pas reellement BUS_OFF.
             } else if (status.state == TWAI_STATE_STOPPED) {
                 Serial.println(F("[CAN] Controleur STOPPED - redemarrage twai_start()"));
                 esp_err_t err = twai_start();
