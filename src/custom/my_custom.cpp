@@ -1,4 +1,3 @@
-}
 // =====================================================================
 // my_custom.cpp - Lecture du capteur température/humidité SHT20 embarqué
 // sur le panneau ZX3D95CE01S-TR-4848 (Panlee), intégrée dans openHASP via
