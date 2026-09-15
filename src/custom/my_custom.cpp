@@ -1,3 +1,4 @@
+}
 // =====================================================================
 // my_custom.cpp - Lecture du capteur température/humidité SHT20 embarqué
 // sur le panneau ZX3D95CE01S-TR-4848 (Panlee), intégrée dans openHASP via
@@ -53,6 +54,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <ArduinoJson.h>
 #include <string.h>
 #include <math.h>
@@ -69,7 +71,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v33 (abandon du lien CAN - ajout affichage adresse MAC WiFi au boot, pour appairage ESP-NOW cote ESP32 secondaire)";
+    "v34 (etape 1 ESP-NOW : heartbeat bidirectionnel Panlee<->secondaire, transmet g_volet_mode, pas encore de pilotage moteur reel)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -844,6 +846,193 @@ static void can_tick() {
 }
 
 // =====================================================================
+// v34 - LIAISON ESP-NOW PANLEE <-> ESP32 SECONDAIRE (remplace le CAN, cf
+// mémoire du projet : le CAN est abandonné le 15/09 après plusieurs
+// semaines de diagnostic infructueux malgré 2 remplacements de
+// transceiver SN65HVD230).
+//
+// ÉTAPE 1 (cette version) : établir et VÉRIFIER le lien radio lui-même
+// avec un simple battement de coeur bidirectionnel, avant d'y accrocher
+// la vraie logique de pilotage du volet (homing, oscillation). Même
+// méthodologie que celle suivie tout du long sur le CAN (heartbeat 0x100/
+// 0x200 avant toute logique métier) - un seul changement vérifié à la
+// fois.
+//
+// CHOIX DE CONCEPTION : les 2 Panlee (chambre 1 et 2) partagent EXACTEMENT
+// le même firmware compilé. Plutôt que de coder en dur l'adresse MAC du
+// secondaire (ce qui obligerait à maintenir 2 builds différents et
+// recrée le risque d'erreur de flash déjà rencontré sur ce projet - cf
+// ESPlogs63, mauvaise version flashée par erreur), ce Panlee détecte sa
+// propre adresse MAC au boot et choisit automatiquement le bon secondaire
+// dans PEER_TABLE ci-dessous.
+//
+// DONNÉE TRANSMISE : g_volet_mode (0=Auto, 1=Fixe, 2=Swing), déjà piloté
+// depuis la page 3 du skin (sélecteur "Auto/Fixe/Swing", voir
+// custom_state_subtopic() plus bas) - pas besoin d'un bouton marche/arrêt
+// séparé, ce sélecteur existant suffit pour piloter le comportement du
+// volet côté secondaire.
+// =====================================================================
+
+// Table de correspondance Panlee <-> ESP32 secondaire, une entrée par
+// chambre. Adresses relevées le 15/09 (logs ESPHome + v33 de ce fichier).
+struct EspNowPeerMapping {
+    const char* panlee_mac;
+    const char* secondaire_mac;
+    const char* nom_chambre;
+};
+static const EspNowPeerMapping ESPNOW_PEER_TABLE[] = {
+    { "A4:CB:8F:DC:52:48", "E0:8C:FE:07:04:B0", "chambre 1" },
+    { "A4:CB:8F:DC:4E:BC", "E0:8C:FE:07:EA:7C", "chambre 2" },
+};
+
+// Message Panlee -> ESP32 secondaire, envoyé toutes les 2s (même cadence
+// que l'ancien heartbeat CAN).
+struct __attribute__((packed)) EspNowCommande {
+    uint8_t  version;   // = 1 (permet de detecter un desaccord de format)
+    uint8_t  type;      // 0 = commande/heartbeat
+    uint8_t  volet_mode;// copie de g_volet_mode : 0=Auto,1=Fixe,2=Swing
+    float    consigne;  // consigne de temperature (pas encore utilisee cote secondaire, prevu pour le pilotage ventilateur)
+    uint32_t compteur;  // sequence incrementale, permet au secondaire de detecter les paquets perdus
+};
+
+// Message ESP32 secondaire -> Panlee (v34 : juste un accuse de reception
+// pour prouver le lien ; le vrai etat du volet viendra a l'etape 2).
+struct __attribute__((packed)) EspNowEtat {
+    uint8_t  version;          // = 1
+    uint8_t  type;             // 1 = etat
+    uint32_t dernier_compteur; // dernier compteur de commande recu, pour verifier qu'aucun paquet n'est perdu
+};
+
+static bool     g_espnow_ready = false;
+static uint8_t  g_espnow_peer_mac[6] = {0};
+static char     g_espnow_chambre[16] = "?";
+static uint32_t g_espnow_compteur_tx = 0;
+static uint32_t g_espnow_next_send_ms = 0;
+static uint32_t g_espnow_dernier_recv_ms = 0;
+static uint32_t g_espnow_dernier_ack_compteur = 0;
+
+static bool espnow_mac_str_to_bytes(const char* str, uint8_t* out) {
+    unsigned int b[6];
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)b[i];
+    return true;
+}
+
+// Callback bas niveau ESP-NOW (signature de la version esp_now.h fournie
+// avec le coeur arduino-esp32 actuel, qui passe une struct d'info source
+// plutot que la seule adresse MAC des versions plus anciennes).
+static void espnow_on_data_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+    (void)info;
+    if (len != (int)sizeof(EspNowEtat)) {
+        Serial.printf("[ESPNOW] Paquet recu de taille inattendue (%d octets, attendu %d) - ignore\n",
+                      len, (int)sizeof(EspNowEtat));
+        return;
+    }
+    EspNowEtat msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.version != 1 || msg.type != 1) {
+        Serial.println(F("[ESPNOW] Paquet recu avec version/type inattendu - ignore"));
+        return;
+    }
+    g_espnow_dernier_recv_ms = millis();
+    g_espnow_dernier_ack_compteur = msg.dernier_compteur;
+    Serial.printf("[ESPNOW] >>> Etat recu du secondaire (%s) : dernier compteur accuse = %u <<<\n",
+                  g_espnow_chambre, (unsigned)msg.dernier_compteur);
+}
+
+static void espnow_setup() {
+    String my_mac = WiFi.macAddress();
+    Serial.printf("[ESPNOW] Recherche de la chambre correspondant a l'adresse MAC de ce Panlee (%s)\n",
+                  my_mac.c_str());
+
+    bool found = false;
+    const char* secondaire_mac_str = "";
+    for (const auto& p : ESPNOW_PEER_TABLE) {
+        if (my_mac.equalsIgnoreCase(p.panlee_mac)) {
+            espnow_mac_str_to_bytes(p.secondaire_mac, g_espnow_peer_mac);
+            strncpy(g_espnow_chambre, p.nom_chambre, sizeof(g_espnow_chambre) - 1);
+            secondaire_mac_str = p.secondaire_mac;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        Serial.println(F("[ESPNOW] ERREUR : adresse MAC de ce Panlee absente de ESPNOW_PEER_TABLE ! Verifier la table (nouveau panneau ? adresse mal recopiee ?)"));
+        return;
+    }
+    Serial.printf("[ESPNOW] Chambre identifiee : %s, peer secondaire = %s\n",
+                  g_espnow_chambre, secondaire_mac_str);
+
+    // Necessaire pour activer le radio WiFi/ESP-NOW ; n'interrompt pas une
+    // eventuelle connexion WiFi deja etablie par openHASP (STA reste STA).
+    WiFi.mode(WIFI_STA);
+
+    esp_err_t err = esp_now_init();
+    if (err != ESP_OK) {
+        Serial.printf("[ESPNOW] Echec esp_now_init() : %d\n", (int)err);
+        return;
+    }
+    esp_now_register_recv_cb(espnow_on_data_recv);
+
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, g_espnow_peer_mac, 6);
+    peer.channel = 0;      // 0 = suivre le canal WiFi courant de ce Panlee
+    peer.encrypt = false;  // pas de chiffrement pour ce premier test (a revoir plus tard si besoin)
+    err = esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+        Serial.printf("[ESPNOW] Echec esp_now_add_peer() : %d\n", (int)err);
+        return;
+    }
+
+    g_espnow_ready = true;
+    g_espnow_next_send_ms = millis() + 2000;
+    Serial.printf("[ESPNOW] Pret (%s). 1er heartbeat dans 2s\n", g_espnow_chambre);
+}
+
+static void espnow_send_commande() {
+    if (!g_espnow_ready) return;
+
+    EspNowCommande msg;
+    msg.version    = 1;
+    msg.type       = 0;
+    msg.volet_mode = g_volet_mode;
+    msg.consigne   = g_consigne;
+    msg.compteur   = ++g_espnow_compteur_tx;
+
+    esp_err_t err = esp_now_send(g_espnow_peer_mac, (const uint8_t*)&msg, sizeof(msg));
+    if (err != ESP_OK) {
+        Serial.printf("[ESPNOW] Echec esp_now_send() : %d\n", (int)err);
+    }
+}
+
+// Non bloquante, appelee depuis custom_loop() a chaque iteration - suit la
+// meme regle que can_tick() : Serial.print() uniquement, jamais de mise a
+// jour d'affichage ici (voir can_tick() plus haut pour la justification).
+static void espnow_tick() {
+    if (!g_espnow_ready) return;
+    uint32_t now = millis();
+
+    if ((int32_t)(now - g_espnow_next_send_ms) >= 0) {
+        espnow_send_commande();
+        g_espnow_next_send_ms = now + 2000;
+    }
+
+    // Signal simple d'absence de lien : pas d'accuse recu depuis >10s alors
+    // qu'on a deja recu au moins un paquet une fois.
+    static bool alerte_deja_loggee = false;
+    if (g_espnow_dernier_recv_ms != 0 && (now - g_espnow_dernier_recv_ms) > 10000) {
+        if (!alerte_deja_loggee) {
+            Serial.println(F("[ESPNOW] ALERTE : aucun accuse du secondaire depuis >10s - lien probablement coupe"));
+            alerte_deja_loggee = true;
+        }
+    } else {
+        alerte_deja_loggee = false;
+    }
+}
+
+// =====================================================================
 // Mise à jour des labels du dashboard (pages.jsonl)
 // Utilise dispatch_text_line(), le point d'entrée officiel openHASP pour
 // injecter une commande "pXbY.attribut=valeur" depuis du code custom -
@@ -932,9 +1121,16 @@ void custom_setup() {
     // dans le MÊME contexte que le driver tactile, pour éliminer tout accès
     // concurrent non synchronisé au bus I2C partagé.
 
-    // v22 : démarrage du bus CAN (TWAI) vers l'ESP32 secondaire - voir
-    // can_setup() plus haut pour le détail.
+    // v22-v32 : bus CAN (TWAI) - CONSERVÉ dans le fichier pour référence mais
+    // le CAN est abandonné (décision du 15/09, voir mémoire du projet).
+    // Toujours démarré ici pour l'instant (ne gêne pas le nouveau lien
+    // ESP-NOW, GPIO différents) ; à retirer proprement dans une prochaine
+    // version dédiée, pas mélangée avec l'ajout de l'ESP-NOW.
     can_setup();
+
+    // v34 : démarrage du lien ESP-NOW vers l'ESP32 secondaire - voir
+    // espnow_setup() plus haut pour le détail.
+    espnow_setup();
 
     // Consigne : rechargée depuis la NVS (survit à un reboot/reflash tant
     // que la partition NVS n'est pas effacée), sinon valeur par défaut 20°C.
@@ -964,9 +1160,10 @@ void custom_loop() {
     // g_humidite, ...) - l'affichage reste exclusivement poussé par
     // custom_every_5seconds(), comme depuis la v8. can_tick() (v22) suit
     // exactement la même règle : Serial.print() uniquement, jamais de
-    // dispatch depuis custom_loop().
+    // dispatch depuis custom_loop(). espnow_tick() (v34) suit la meme regle.
     sht20_state_machine_tick();
     can_tick();
+    espnow_tick();
 }
 
 void custom_every_second() {
@@ -1062,6 +1259,11 @@ void custom_state_subtopic(const char* subtopic, const char* payload) {
         prefs.putUChar("volet_mode", g_volet_mode);
         Serial.printf("[custom] Position volet -> %u\n", g_volet_mode);
         update_dashboard_labels();
+
+        // v34 : envoi immediat au secondaire par ESP-NOW, sans attendre le
+        // prochain heartbeat (jusqu'a 2s) - un changement de mode volet doit
+        // se sentir reactif, comme un appui physique.
+        espnow_send_commande();
     }
 }
 
