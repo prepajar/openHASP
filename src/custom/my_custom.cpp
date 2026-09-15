@@ -70,7 +70,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v34 (etape 1 ESP-NOW : heartbeat bidirectionnel Panlee<->secondaire, transmet g_volet_mode, pas encore de pilotage moteur reel)";
+    "v34b (etape 1 ESP-NOW : heartbeat bidirectionnel Panlee<->secondaire, transmet g_volet_mode ; corrige signature esp_now_recv_cb pour platform-espressif32 2023.10.03/ESP-IDF 4.4)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -919,9 +919,15 @@ static bool espnow_mac_str_to_bytes(const char* str, uint8_t* out) {
     return true;
 }
 
-// Callback bas niveau ESP-NOW (signature de la version esp_now.h fournie
-// avec le coeur arduino-esp32 actuel, qui passe une struct d'info source
-// plutot que la seule adresse MAC des versions plus anciennes).
+// v34 fix (build GitHub Actions casse sur toute la matrice de boards) :
+// la signature du callback esp_now_register_recv_cb() a change entre les
+// versions du coeur Arduino-ESP32 - ancien (<= core 2.x / ESP-IDF 4.4,
+// c'est le cas ici : platform-espressif32 2023.10.03 utilise par le fork
+// openHASP) = (const uint8_t *mac, const uint8_t *data, int len) ; recent
+// (core 3.x / ESP-IDF 5.x) = (const esp_now_recv_info_t *info, ...).
+// Selection automatique via ESP_IDF_VERSION_MAJOR pour rester compatible
+// si le fork change un jour de version de plateforme.
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
 static void espnow_on_data_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     (void)info;
     if (len != (int)sizeof(EspNowEtat)) {
@@ -940,6 +946,29 @@ static void espnow_on_data_recv(const esp_now_recv_info_t* info, const uint8_t* 
     Serial.printf("[ESPNOW] >>> Etat recu du secondaire (%s) : dernier compteur accuse = %u <<<\n",
                   g_espnow_chambre, (unsigned)msg.dernier_compteur);
 }
+#else
+// Ancienne signature (confirmee par l'erreur de compilation GitHub Actions
+// du 15/09 : platform-espressif32 2023.10.03, esp_now_recv_cb_t attend
+// (const uint8_t*, const uint8_t*, int), pas de esp_now_recv_info_t).
+static void espnow_on_data_recv(const uint8_t* mac_addr, const uint8_t* data, int len) {
+    (void)mac_addr;
+    if (len != (int)sizeof(EspNowEtat)) {
+        Serial.printf("[ESPNOW] Paquet recu de taille inattendue (%d octets, attendu %d) - ignore\n",
+                      len, (int)sizeof(EspNowEtat));
+        return;
+    }
+    EspNowEtat msg;
+    memcpy(&msg, data, sizeof(msg));
+    if (msg.version != 1 || msg.type != 1) {
+        Serial.println(F("[ESPNOW] Paquet recu avec version/type inattendu - ignore"));
+        return;
+    }
+    g_espnow_dernier_recv_ms = millis();
+    g_espnow_dernier_ack_compteur = msg.dernier_compteur;
+    Serial.printf("[ESPNOW] >>> Etat recu du secondaire (%s) : dernier compteur accuse = %u <<<\n",
+                  g_espnow_chambre, (unsigned)msg.dernier_compteur);
+}
+#endif
 
 static void espnow_setup() {
     String my_mac = WiFi.macAddress();
