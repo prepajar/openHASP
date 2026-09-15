@@ -1,3 +1,4 @@
+
 // =====================================================================
 // my_custom.cpp - Lecture du capteur température/humidité SHT20 embarqué
 // sur le panneau ZX3D95CE01S-TR-4848 (Panlee), intégrée dans openHASP via
@@ -57,7 +58,6 @@
 #include <ArduinoJson.h>
 #include <string.h>
 #include <math.h>
-#include "driver/twai.h"
 
 // =====================================================================
 // v18 - REPÈRE DE VERSION AU BOOT
@@ -70,7 +70,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v34b (etape 1 ESP-NOW : heartbeat bidirectionnel Panlee<->secondaire, transmet g_volet_mode ; corrige signature esp_now_recv_cb pour platform-espressif32 2023.10.03/ESP-IDF 4.4)";
+    "v35 (ESP-NOW valide bidirectionnel - code CAN/TWAI completement retire, GPIO9/GPIO7 liberes)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -427,424 +427,6 @@ static void sht20_state_machine_tick() {
 }
 
 // =====================================================================
-// v22 - Test du lien CAN (TWAI) avec l'ESP32 secondaire
-//
-// Objectif : valider UNIQUEMENT le lien CAN avant de lui faire porter la
-// moindre vraie commande - même méthode incrémentale que pour le SHT20 et
-// que le test déjà validé côté ESP32 secondaire (esp32_secondaire_can_test.yaml).
-// Envoie un battement de coeur toutes les 2s (id 0x100), écoute/journalise
-// les battements de coeur reçus de l'ESP32 secondaire (id 0x200). Dès que
-// les DEUX côtés loguent des réceptions, le lien est validé et on pourra
-// remplacer ces battements de coeur par les vraies trames de commande/état.
-//
-// Utilise le driver TWAI natif d'ESP-IDF (driver/twai.h, inclus dans le
-// core arduino-esp32, aucune librairie externe à ajouter au build GitHub
-// Actions). Broches d'origine (v22-v24) : connecteur 20 broches,
-// EXT_IO3/EXT_IO4 - CAN_TX (CTX) = GPIO19, CAN_RX (CRX) = GPIO7.
-//
-// v25 - TEST DIAGNOSTIC TEMPORAIRE #1 : à l'oscilloscope, AUCUNE activité
-// électrique constatée sur GPIO19 ET GPIO7 malgré des envois "réussis" côté
-// logiciel (mise en file d'attente OK, cf commentaire v23 plus bas). Bascule
-// de test sur GPIO2/GPIO1 (pins 17-18, TXD_EXT/RXD_EXT) - PAS retenue comme
-// solution finale (câblées en interne à la puce RS485 SP3485 du Panlee,
-// risque de charge/bruit confirmé).
-//
-// v26 - TEST DIAGNOSTIC TEMPORAIRE #2 (ESPlogs 51) : sur GPIO2/GPIO1, le
-// bus est entré en erreur de bus RÉELLE dès le tout premier battement de
-// coeur ("ALERTE : erreur de bus (bit/stuff/crc/form)" - erreur matérielle
-// directe, pas juste une absence d'ACK) suivie d'un BUS_OFF quasi
-// instantané, cycle qui se répète à chaque redémarrage - cohérent avec
-// l'hypothèse d'interférence de la puce RS485 sur GPIO2/GPIO1. Bascule sur
-// GPIO9/GPIO20 (EXT_IO1/EXT_IO2).
-//
-// v27 - TEST DIAGNOSTIC TEMPORAIRE #3 (ESPlogs 52) : sur GPIO9/GPIO20, DÉLUGE
-// CONTINU et ININTERROMPU d'alertes "erreur de bus (bit/stuff/crc/form)"
-// (des centaines en quelques secondes, sans discontinuer) - bien plus
-// intense que sur GPIO2/GPIO1. Explication très probable : GPIO20 est
-// l'AUTRE broche USB natif fixée au niveau du silicium de l'ESP32-S3
-// (USB_D+, alors que GPIO19 = USB_D-, cf commentaire v25) - si le
-// périphérique USB natif est actif, GPIO20 reçoit en continu le signal
-// différentiel USB (haute fréquence, aucun rapport avec une trame CAN), que
-// le contrôleur TWAI essaie sans arrêt d'interpréter comme des bits CAN,
-// d'où ce flot d'erreurs ininterrompu. En revanche GPIO9 (émission) a l'air
-// de bien fonctionner sur ce test - c'est spécifiquement la réception sur
-// GPIO20 qui est polluée. Dernière combinaison EXT_IO du connecteur jamais
-// essayée et qui évite à la fois l'USB natif (GPIO19/GPIO20) ET le RS485
-// (GPIO1/GPIO2) : GPIO9 (déjà validée comme fonctionnelle) + GPIO7. Câblage
-// requis : GPIO9 -> CTX du transceiver (inchangé), GPIO7 -> CRX du
-// transceiver (à la place de GPIO20).
-//
-// v27 seul (ESPlogs 53) : propre - mais AUCUN partenaire réel actif au bon
-// moment (TEC=REC=erreurs_bus=0 en permanence). Avec l'ESP32 secondaire
-// réellement actif (ESPlogs 55, 12/09/2026) : MÊME déluge continu que v26
-// (TEC grimpe vite en erreur-passive, erreurs_bus dans les milliers en
-// quelques secondes) alors que GPIO7 (RX) est différent de GPIO20 (RX v26) -
-// seul GPIO9 (TX) est commun aux 2 tests. Polarité CANH/CANL, débit annoncé
-// (125kbps des 2 côtés), masse commune, câblage CTX/CRX et module
-// transceiver ont tous été vérifiés/écartés un par un. Mesures à l'oscillo à
-// 125kbps non concluantes (le DSO Shell, ~200kHz de bande passante, lisse
-// tout signal aussi rapide qu'un bit CAN de 8µs - impossible de confirmer ou
-// d'infirmer le timing réel à l'oeil sur cet appareil à cette vitesse).
-//
-// v28 - TEST DIAGNOSTIC TEMPORAIRE #4 : bascule du débit CAN de 125kbps à
-// 50kbps (bit de 20µs au lieu de 8µs - dans les capacités du DSO Shell) des
-// DEUX côtés (Panlee ET secondaire, cf esp32_secondaire_can_test.yaml), sans
-// toucher au câblage GPIO9/GPIO7 déjà en place. Objectif : si le déluge
-// disparaît à 50kbps, ça confirme un problème de timing/qualité de signal
-// marginal à 125kbps (càble, capacité parasite, temps de montée du
-// transceiver) ; si le déluge persiste même à 50kbps, le débit est écarté et
-// il faut chercher un défaut électrique encore non identifié, indépendant de
-// la vitesse.
-//
-// v28 résultat (ESPlogs 56/57/58) : déluge identique à 50kbps qu'à 125kbps -
-// débit écarté. MAIS observation nouvelle et très cohérente sur plusieurs
-// essais : dès le boot, les erreurs commencent quasi immédiatement (parfois
-// BUS_OFF en seulement 8s), et le fait de débrancher puis rebrancher le fil
-// TX (GPIO9->CTX) semble à chaque fois faire "repartir" le bus proprement.
-// Hypothèse retenue (analyse tierce, cohérente avec le comportement documenté
-// du driver TWAI ESP-IDF) : au tout début du boot de l'ESP32-S3, avant que
-// twai_driver_install()/twai_start() ne prenne le contrôle de GPIO9, l'état
-// de cette broche n'est pas garanti (flottant ou indéterminé pendant les
-// premières ms du reset). Si le SN65HVD230 lit un niveau bas (dominant) sur
-// son entrée D/TXD pendant cette fenêtre, il polluerait le bus dès le
-// démarrage, avant même que quoi que ce soit de valide ait pu être échangé -
-// cohérent avec l'apparition quasi instantanée des erreurs. Débrancher TX
-// isole cette entrée du transceiver le temps que GPIO9 soit repris
-// proprement par le driver TWAI (qui le met au repos récessif/HIGH une fois
-// actif) ; rebrancher ensuite ne réintroduit pas le problème puisque GPIO9
-// est déjà piloté correctement à ce moment-là. N'explique pas à lui seul les
-// épisodes de ré-accumulation d'erreurs observés plusieurs dizaines de
-// secondes après un démarrage propre (ESPlogs 56/57) - il pourrait y avoir
-// plus d'une cause, à surveiller.
-//
-// v29 - CORRECTIF CIBLÉ : force GPIO9 en sortie HIGH (récessif) AVANT
-// d'installer/démarrer le driver TWAI, avec un court délai de stabilisation,
-// pour garantir que le SN65HVD230 ne voit jamais un niveau bas parasite sur
-// son entrée D/TXD pendant le boot - sans avoir besoin de débrancher/
-// rebrancher TX manuellement. Ajout aussi d'un délai de 2s avant le premier
-// battement de coeur réel (au lieu d'émettre quasi immédiatement après
-// twai_start()), pour laisser le bus se stabiliser. Câblage et débit
-// inchangés (GPIO9/GPIO7, 50kbps) - un seul changement à la fois par rapport
-// à v28, conformément à la méthode suivie depuis le début de ce diagnostic.
-// Note : l'ajout d'une résistance de pull-up matérielle (10kΩ entre GPIO9 et
-// 3.3V côté transceiver) proposée en complément n'est PAS incluse dans ce
-// test - à envisager séparément seulement si le correctif logiciel seul ne
-// suffit pas, pour ne pas mélanger deux variables dans le même essai.
-//
-// v29 résultat (ESPlogs 59) : le correctif logiciel seul n'a RIEN changé -
-// "c'est pareil" confirmé par le log : bus parfaitement propre (TEC=REC=
-// erreurs_bus=0) pendant toute la phase de stabilisation, PUIS déluge
-// d'erreurs qui démarre à l'instant EXACT du tout premier battement de coeur
-// émis (2s après twai_start(), comme prévu). Ça réfute l'hypothèse "état
-// indéterminé de GPIO9 au boot pollue le bus" - le bus était démontré sain
-// avant toute émission. La panne n'est donc pas liée au BOOT mais à l'ACTE
-// D'ÉMISSION lui-même. Ensuite l'utilisatrice a ajouté la résistance de
-// pull-up matérielle 10kΩ (GPIO9->3.3V côté transceiver) SANS retirer ce
-// correctif logiciel (ESPlogs 60) : même conclusion (toujours zéro trame
-// échangée), mais la manifestation change - BUS_OFF complet et quasi
-// instantané dès le 1er battement (au lieu de rester bloqué en erreur-
-// passive), avec un cycle parfaitement répétitif toutes les ~10s et
-// `erreurs_bus` figé à EXACTEMENT 31 à chaque cycle (signature déterministe,
-// pas du bruit aléatoire).
-//
-// v30 - RETRAIT DU FORCE-HIGH LOGICIEL (résistance matérielle conservée) :
-// après vérification à l'oscilloscope en mode NORM/HOLD (pas AUTO), aucune
-// activité électrique constatée sur GPIO9/GPIO7 malgré les logs logiciels
-// montrant des tentatives d'émission régulières ("Battement de coeur
-// envoye"). Hypothèse à tester (analyse tierce, jugée plausible) : le bloc
-// `pinMode(OUTPUT); digitalWrite(HIGH); delay(1000);` ajouté en v29 AVANT
-// `twai_driver_install()` pourrait interférer avec la prise de contrôle
-// réelle de la broche GPIO9 par le driver TWAI (matrice GPIO de l'ESP32-S3),
-// empêchant le périphérique TWAI de réellement piloter la broche même si
-// `twai_start()` retourne ESP_OK - cohérent avec le fait qu'une activité
-// carrée franche avait bien été observée à l'oscillo sur GPIO9 AVANT
-// l'introduction de ce bloc (v26/v27, tests du 11-12/09). Ce test retire
-// uniquement ce bloc logiciel (pinMode/digitalWrite/delay) et ne garde QUE
-// `twai_driver_install()`/`twai_start()` - la résistance de pull-up 10kΩ
-// matérielle assure seule l'état récessif au repos pendant le boot. Un seul
-// changement à la fois par rapport à v29+pull-up (ESPlogs 60) : câblage,
-// débit (50kbps) et délai de 2s avant le 1er battement inchangés.
-//
-// NON BLOQUANT (même règle que sht20_state_machine_tick(), voir plus haut) :
-// twai_transmit()/twai_receive() sont appelés avec un timeout de 0 tick,
-// donc ils retournent immédiatement (succès, mailbox pleine, ou rien à
-// lire) sans jamais mettre custom_loop() en pause. can_tick() ne fait que
-// des Serial.print() - jamais de dispatch_text_line()/
-// update_dashboard_labels() depuis ici, même règle de sécurité que pour le
-// SHT20 (cf RÈGLE CRITIQUE au-dessus de custom_loop() plus bas).
-// =====================================================================
-static const gpio_num_t CAN_TX_GPIO = GPIO_NUM_9;
-static const gpio_num_t CAN_RX_GPIO = GPIO_NUM_7;
-static const uint32_t   CAN_HEARTBEAT_ID     = 0x100;
-static const uint32_t   CAN_LISTEN_ID        = 0x200;
-static const uint32_t   CAN_SEND_INTERVAL_MS = 2000;
-static const uint32_t   CAN_STATUS_INTERVAL_MS = 5000;
-
-static bool     g_can_ready          = false;
-static uint32_t g_can_next_send_ms   = 0;
-static uint32_t g_can_next_status_ms = 0;
-
-// =====================================================================
-// v31 - DIAGNOSTIC CIBLE : reproduire en logiciel le geste qui fonctionne
-// physiquement chez l'utilisateur : débrancher TX, attendre, rebrancher TX.
-//
-// IMPORTANT : pour CE TEST, retirer la résistance pull-up 10kΩ de GPIO9.
-// Le premier BUS_OFF déclenche UNE SEULE FOIS la séquence suivante :
-//   1) désinstallation complète du driver TWAI ;
-//   2) GPIO9 placé en INPUT (haute impédance) pendant 1 seconde ;
-//   3) réinstallation + redémarrage du TWAI ;
-//   4) attente de 2 secondes avant le premier heartbeat.
-//
-// Cette séquence est non bloquante : aucune delay() dans custom_loop().
-// Si le CAN fonctionne après cette séquence sans manipulation physique,
-// cela indiquera que la libération/réinitialisation de la voie TX est le
-// mécanisme utile derrière le débranchement/rebranchement manuel.
-//
-// v31 résultat (ESPlogs 62) : le diagnostic ne s'est JAMAIS déclenché - le
-// contrôleur est resté en TWAI_STATE_RUNNING avec TEC=128 (erreur-passive)
-// pendant toute la durée du test (18s), erreurs_bus grimpant sans fin
-// (1902 -> 5067 -> 8232), sans jamais atteindre un vrai TWAI_STATE_BUS_OFF -
-// exactement le même pattern que v29 SANS pull-up (ESPlogs 59). Corrélation
-// nette sur l'ensemble des tests à ce stade : AVEC la résistance de pull-up
-// 10kΩ (ESPlogs 60 en v29, ESPlogs 61 en v30), le contrôleur bascule
-// rapidement en BUS_OFF complet ; SANS elle (ESPlogs 59 en v29, ESPlogs 62
-// en v31), il reste indéfiniment bloqué en erreur-passive (TEC=128 fixe)
-// sans jamais franchir le seuil BUS_OFF (256). Le déclencheur du diagnostic
-// v31 (condition stricte `status.state == TWAI_STATE_BUS_OFF`) ne pouvait
-// donc pas s'activer dans cette configuration matérielle - le test n'a pas
-// infirmé le mécanisme de libération TX, il n'a simplement jamais eu
-// l'occasion de s'exécuter.
-//
-// v32 - DÉCLENCHEMENT ÉLARGI : le diagnostic se déclenche maintenant dès que
-// TEC>=128 est observé (erreur-passive), que l'état rapporté soit RUNNING ou
-// BUS_OFF - plus besoin d'atteindre le seuil BUS_OFF (256) qui ne semble
-// jamais franchi sans la résistance de pull-up. Reste sans pull-up (câblage
-// matériel inchangé depuis v31) - un seul changement à la fois (le
-// déclencheur), pas le câblage.
-// =====================================================================
-enum CanDiagState : uint8_t {
-    CAN_DIAG_NORMAL = 0,
-    CAN_DIAG_TX_RELEASED_WAIT,
-    CAN_DIAG_RESTARTED
-};
-
-static CanDiagState g_can_diag_state = CAN_DIAG_NORMAL;
-static bool          g_can_diag_attempted = false;
-static uint32_t      g_can_diag_deadline_ms = 0;
-
-static bool can_install_and_start(const char* reason) {
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
-
-    g_config.alerts_enabled = TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED |
-                               TWAI_ALERT_RX_DATA    | TWAI_ALERT_BUS_ERROR |
-                               TWAI_ALERT_ERR_PASS    | TWAI_ALERT_BUS_OFF;
-
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_50KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
-    if (err != ESP_OK) {
-        Serial.printf("[CAN][v32] Echec twai_driver_install (%s) : %s (%d)\n",
-                      reason, esp_err_to_name(err), (int)err);
-        g_can_ready = false;
-        return false;
-    }
-
-    err = twai_start();
-    if (err != ESP_OK) {
-        Serial.printf("[CAN][v32] Echec twai_start (%s) : %s (%d)\n",
-                      reason, esp_err_to_name(err), (int)err);
-        (void)twai_driver_uninstall();
-        g_can_ready = false;
-        return false;
-    }
-
-    g_can_ready = true;
-    g_can_next_send_ms = millis() + 2000;
-    g_can_next_status_ms = millis() + CAN_STATUS_INTERVAL_MS;
-    Serial.printf("[CAN][v32] TWAI demarre (%s), 50kbps, TX=GPIO9, RX=GPIO7 - 1er heartbeat dans 2s\n", reason);
-    return true;
-}
-
-static void can_begin_tx_release_diagnostic(uint32_t now) {
-    if (g_can_diag_attempted) return;
-    g_can_diag_attempted = true;
-
-    Serial.println(F("[CAN][v32] === Seuil erreur-passive/BUS_OFF atteint : debut diagnostic liberation TX ==="));
-    Serial.println(F("[CAN][v32] Desinstallation TWAI puis GPIO9 en haute impedance pendant 1s"));
-
-    // En BUS_OFF ou en erreur-passive prolongee, twai_stop() peut retourner un
-    // état invalide selon la version ESP-IDF. On journalise le résultat mais
-    // on tente quand même uninstall().
-    esp_err_t err_stop = twai_stop();
-    Serial.printf("[CAN][v32] twai_stop() -> %s (%d)\n",
-                  esp_err_to_name(err_stop), (int)err_stop);
-
-    esp_err_t err_uninstall = twai_driver_uninstall();
-    Serial.printf("[CAN][v32] twai_driver_uninstall() -> %s (%d)\n",
-                  esp_err_to_name(err_uninstall), (int)err_uninstall);
-
-    if (err_uninstall != ESP_OK) {
-        Serial.println(F("[CAN][v32] Impossible de liberer le driver : diagnostic abandonne, recuperation TWAI classique"));
-        (void)twai_initiate_recovery();
-        return;
-    }
-
-    g_can_ready = false;
-
-    // Équivalent logiciel le plus proche du fil TX physiquement débranché :
-    // GPIO9 n'est plus piloté par le périphérique TWAI et passe en entrée.
-    pinMode((int)CAN_TX_GPIO, INPUT);
-    g_can_diag_state = CAN_DIAG_TX_RELEASED_WAIT;
-    g_can_diag_deadline_ms = now + 1000;
-    Serial.println(F("[CAN][v32] GPIO9 libere (INPUT/Hi-Z). Attente 1000ms..."));
-}
-
-static void can_diag_tick(uint32_t now) {
-    if (g_can_diag_state != CAN_DIAG_TX_RELEASED_WAIT) return;
-    if ((int32_t)(now - g_can_diag_deadline_ms) < 0) return;
-
-    Serial.println(F("[CAN][v32] Fin des 1000ms : reinstallation complete du TWAI..."));
-
-    if (can_install_and_start("apres liberation TX 1s")) {
-        g_can_diag_state = CAN_DIAG_RESTARTED;
-        Serial.println(F("[CAN][v32] === REDEMARRAGE TWAI OK : NE PAS toucher au fil TX, observer la suite ==="));
-    } else {
-        Serial.println(F("[CAN][v32] === ECHEC reinstallation TWAI apres liberation TX ==="));
-    }
-}
-
-static void can_setup() {
-    Serial.println(F("[CAN][v32] Initialisation CAN de diagnostic SANS pull-up 10k sur GPIO9"));
-    Serial.println(F("[CAN][v32] A TEC>=128 ou BUS_OFF, GPIO9 sera libere 1s puis le driver TWAI sera reinstalle automatiquement"));
-    (void)can_install_and_start("demarrage initial");
-}
-
-// Non bloquante, appelée depuis custom_loop() à chaque itération.
-static void can_tick() {
-    uint32_t now = millis();
-
-    // Cette machine doit continuer à tourner même quand g_can_ready=false,
-    // puisque le driver est volontairement désinstallé pendant 1 seconde.
-    can_diag_tick(now);
-    if (!g_can_ready) return;
-
-    // --- Envoi du battement de coeur toutes les 2s ---
-    if ((int32_t)(now - g_can_next_send_ms) >= 0) {
-        twai_message_t msg = {};
-        msg.identifier = CAN_HEARTBEAT_ID;
-        msg.data_length_code = 2;
-        msg.data[0] = 0xAA;
-        msg.data[1] = 0x55;
-
-        esp_err_t err = twai_transmit(&msg, 0);
-        if (err == ESP_OK) {
-            Serial.println(F("[CAN] Battement de coeur envoye (id 0x100) [mise en file OK - attente ACK reel]"));
-        } else {
-            Serial.printf("[CAN] Echec envoi (id 0x100) : %s (code brut %d)\n",
-                          esp_err_to_name(err), (int)err);
-        }
-        g_can_next_send_ms = now + CAN_SEND_INTERVAL_MS;
-    }
-
-    // --- Alertes matérielles TWAI ---
-    uint32_t alerts = 0;
-    if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0) {
-        if (alerts & TWAI_ALERT_TX_SUCCESS) {
-            Serial.println(F("[CAN] >>> TX_SUCCESS : trame transmise ET ACQUITTEE <<<"));
-        }
-        if (alerts & TWAI_ALERT_TX_FAILED) {
-            Serial.println(F("[CAN] ALERTE : echec de transmission / absence ACK"));
-        }
-        if (alerts & TWAI_ALERT_RX_DATA) {
-            Serial.println(F("[CAN] >>> RX_DATA : trame recue <<<"));
-        }
-        if (alerts & TWAI_ALERT_BUS_ERROR) {
-            Serial.println(F("[CAN] ALERTE : erreur de bus (bit/stuff/crc/form)"));
-        }
-        if (alerts & TWAI_ALERT_ERR_PASS) {
-            Serial.println(F("[CAN] ALERTE : passage erreur-passive"));
-        }
-        if (alerts & TWAI_ALERT_BUS_OFF) {
-            Serial.println(F("[CAN] ALERTE : BUS_OFF"));
-        }
-    }
-
-    // --- Réception ---
-    twai_message_t rx_msg;
-    while (twai_receive(&rx_msg, 0) == ESP_OK) {
-        Serial.printf("[CAN] Trame recue id=0x%03X, %d octet(s) :",
-                      (unsigned)rx_msg.identifier, rx_msg.data_length_code);
-        for (int i = 0; i < rx_msg.data_length_code; i++) {
-            Serial.printf(" %02X", rx_msg.data[i]);
-        }
-        Serial.println();
-
-        if (rx_msg.identifier == CAN_LISTEN_ID) {
-            Serial.println(F("[CAN] >>> HEARTBEAT 0x200 ESP32 SECONDAIRE RECU : liaison valide dans ce sens <<<"));
-        }
-    }
-
-    // --- État périodique ---
-    if ((int32_t)(now - g_can_next_status_ms) >= 0) {
-        twai_status_info_t status;
-        if (twai_get_status_info(&status) == ESP_OK) {
-            const char* state_str;
-            switch (status.state) {
-                case TWAI_STATE_STOPPED:    state_str = "STOPPED";    break;
-                case TWAI_STATE_RUNNING:    state_str = "RUNNING";    break;
-                case TWAI_STATE_BUS_OFF:    state_str = "BUS_OFF";    break;
-                case TWAI_STATE_RECOVERING: state_str = "RECOVERING"; break;
-                default:                    state_str = "?";          break;
-            }
-
-            Serial.printf("[CAN] Etat bus : %s, TEC=%u, REC=%u, txq=%u, rxq=%u, erreurs_bus=%u, ratees_rx=%u, diag=%s\n",
-                          state_str,
-                          (unsigned)status.tx_error_counter,
-                          (unsigned)status.rx_error_counter,
-                          (unsigned)status.msgs_to_tx,
-                          (unsigned)status.msgs_to_rx,
-                          (unsigned)status.bus_error_count,
-                          (unsigned)status.rx_missed_count,
-                          g_can_diag_attempted ? "DEJA_EFFECTUE" : "PAS_ENCORE");
-
-            // v32 - ESPlogs62 (v31) : sans la resistance de pull-up, le
-            // controleur reste bloque en TWAI_STATE_RUNNING avec TEC=128
-            // (erreur-passive) indefiniment, sans jamais atteindre
-            // TWAI_STATE_BUS_OFF (256) - la condition stricte de v31 ne se
-            // declenchait donc jamais. Elargie ici : TEC>=128 suffit,
-            // quel que soit l'etat rapporte (RUNNING ou BUS_OFF).
-            bool needs_recovery = (status.state == TWAI_STATE_BUS_OFF) ||
-                                   (status.tx_error_counter >= 128);
-            if (needs_recovery) {
-                if (!g_can_diag_attempted) {
-                    Serial.printf("[CAN][v32] Seuil erreur-passive/BUS_OFF atteint (TEC=%u, etat=%s) - declenchement diagnostic\n",
-                                  (unsigned)status.tx_error_counter, state_str);
-                    can_begin_tx_release_diagnostic(now);
-                    // Le driver peut avoir été désinstallé ci-dessus.
-                    return;
-                } else if (status.state == TWAI_STATE_BUS_OFF) {
-                    Serial.println(F("[CAN][v32] BUS_OFF apres diagnostic : recuperation TWAI classique"));
-                    (void)twai_initiate_recovery();
-                }
-                // Si deja tente ET juste erreur-passive (pas BUS_OFF), on
-                // laisse le controleur continuer tel quel - pas de nouvelle
-                // action tant qu'il ne passe pas reellement BUS_OFF.
-            } else if (status.state == TWAI_STATE_STOPPED) {
-                Serial.println(F("[CAN] Controleur STOPPED - redemarrage twai_start()"));
-                esp_err_t err = twai_start();
-                Serial.printf("[CAN] twai_start() -> %s (%d)\n", esp_err_to_name(err), (int)err);
-                if (err == ESP_OK) {
-                    g_can_next_send_ms = now + 2000;
-                }
-            }
-        }
-        g_can_next_status_ms = now + CAN_STATUS_INTERVAL_MS;
-    }
-}
-
-// =====================================================================
 // v34 - LIAISON ESP-NOW PANLEE <-> ESP32 SECONDAIRE (remplace le CAN, cf
 // mémoire du projet : le CAN est abandonné le 15/09 après plusieurs
 // semaines de diagnostic infructueux malgré 2 remplacements de
@@ -1036,8 +618,9 @@ static void espnow_send_commande() {
 }
 
 // Non bloquante, appelee depuis custom_loop() a chaque iteration - suit la
-// meme regle que can_tick() : Serial.print() uniquement, jamais de mise a
-// jour d'affichage ici (voir can_tick() plus haut pour la justification).
+// meme regle que l'ancien can_tick() (retire en v35) : Serial.print()
+// uniquement, jamais de mise a jour d'affichage ici (regle heritee de la
+// v7, voir custom_loop() plus bas).
 static void espnow_tick() {
     if (!g_espnow_ready) return;
     uint32_t now = millis();
@@ -1149,12 +732,12 @@ void custom_setup() {
     // dans le MÊME contexte que le driver tactile, pour éliminer tout accès
     // concurrent non synchronisé au bus I2C partagé.
 
-    // v22-v32 : bus CAN (TWAI) - CONSERVÉ dans le fichier pour référence mais
-    // le CAN est abandonné (décision du 15/09, voir mémoire du projet).
-    // Toujours démarré ici pour l'instant (ne gêne pas le nouveau lien
-    // ESP-NOW, GPIO différents) ; à retirer proprement dans une prochaine
-    // version dédiée, pas mélangée avec l'ajout de l'ESP-NOW.
-    can_setup();
+    // v35 : le CAN (TWAI) est retiré (décision du 15/09 - voir mémoire du
+    // projet, ESP-NOW valide et confirme fonctionnel dans les deux sens le
+    // même jour). Le code CAN complet (câblage GPIO9/GPIO7, saga de
+    // diagnostic v22-v32) reste consultable dans l'historique git de ce
+    // fichier - pas la peine de l'y laisser mort, il ralentissait aussi la
+    // boucle principale (Serial.print en rafale pendant un déluge d'erreurs).
 
     // v34 : démarrage du lien ESP-NOW vers l'ESP32 secondaire - voir
     // espnow_setup() plus haut pour le détail.
@@ -1186,11 +769,11 @@ void custom_loop() {
     // avec des redémarrages en boucle (ESPlogs 13). sht20_state_machine_tick()
     // se contente de mettre à jour des variables internes (g_temperature,
     // g_humidite, ...) - l'affichage reste exclusivement poussé par
-    // custom_every_5seconds(), comme depuis la v8. can_tick() (v22) suit
-    // exactement la même règle : Serial.print() uniquement, jamais de
-    // dispatch depuis custom_loop(). espnow_tick() (v34) suit la meme regle.
+    // custom_every_5seconds(), comme depuis la v8. espnow_tick() (v34,
+    // remplace l'ancien can_tick() retire en v35) suit exactement la meme
+    // regle : Serial.print() uniquement, jamais de dispatch depuis
+    // custom_loop().
     sht20_state_machine_tick();
-    can_tick();
     espnow_tick();
 }
 
@@ -1240,11 +823,10 @@ bool custom_pin_in_use(uint8_t pin) {
     // officiel d'openHASP (bus I2C partagé) - pas besoin de les
     // re-déclarer ici, on ne fait que réutiliser un bus déjà géré.
     //
-    // v31 : CAN sur GPIO9/GPIO7 a 50kbps pour diagnostic. CAN_TX/CAN_RX
-    // réservées explicitement ici pour
-    // éviter qu'une configuration GPIO openHASP (hasp config) ne vienne les
-    // réutiliser par erreur pour autre chose.
-    if (pin == (uint8_t)CAN_TX_GPIO || pin == (uint8_t)CAN_RX_GPIO) return true;
+    // v35 : GPIO9/GPIO7 (EXT_IO1/EXT_IO4) ne sont plus réservées ici - le
+    // CAN qui les utilisait est retiré (ESP-NOW ne consomme aucun GPIO
+    // dédié). Libres pour un usage futur si besoin.
+    (void)pin;
     return false;
 }
 
