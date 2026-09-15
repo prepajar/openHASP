@@ -69,7 +69,7 @@
 // doute pour tous les tests futurs : le firmware réellement actif s'annonce
 // lui-même dès le boot, indépendamment de ce qu'on CROIT avoir flashé.
 static const char* FIRMWARE_VERSION =
-    "v32 (diagnostic CAN GPIO9/GPIO7 50kbps - SANS pull-up, liberation logicielle TX 1s declenchee des erreur-passive (TEC>=128), pas seulement BUS_OFF)";
+    "v33 (abandon du lien CAN - ajout affichage adresse MAC WiFi au boot, pour appairage ESP-NOW cote ESP32 secondaire)";
 
 // MODE SIMULATION - premier test du "skin" openHASP sur le vrai panneau,
 // sans ESP32 secondaire ni liaison CAN branchés. Température/humidité
@@ -904,6 +904,13 @@ void custom_setup() {
     // initialisation - permet de confirmer sans ambiguïté depuis un simple
     // log série quel firmware tourne réellement sur le panneau.
     Serial.printf("[custom] my_custom.cpp - version : %s\n", FIRMWARE_VERSION);
+
+    // v33 : adresse MAC WiFi affichée au boot - nécessaire pour enregistrer
+    // ce Panlee comme "peer" ESP-NOW statique côté ESP32 secondaire (voir
+    // mémoire du projet, section ESP-NOW/appairage). Le WiFi n'a pas besoin
+    // d'être connecté à un point d'accès pour lire l'adresse MAC du
+    // contrôleur radio - elle est disponible dès l'initialisation matérielle.
+    Serial.printf("[custom] Adresse MAC WiFi (pour appairage ESP-NOW) : %s\n", WiFi.macAddress().c_str());
 
     // v13 : le bus I2C (SDA=15/SCL=6) est déjà initialisé par le driver
     // tactile FT6336U d'openHASP avant l'appel à custom_setup(). On ne
